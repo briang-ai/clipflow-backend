@@ -16,6 +16,25 @@ load_dotenv()
 # --- App ---
 app = FastAPI(title="ClipFlow API")
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# CORS must be added immediately after app creation
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://clipflow.pro",
+        "https://www.clipflow.pro",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- CORS (allow your frontend domains to call this API) ---
 allowed_origins = [
     "http://localhost:3000",
