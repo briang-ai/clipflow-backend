@@ -16,44 +16,11 @@ load_dotenv()
 # --- App ---
 app = FastAPI(title="ClipFlow API")
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-# CORS must be added immediately after app creation
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://clipflow.pro",
         "https://www.clipflow.pro",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- CORS (allow your frontend domains to call this API) ---
-allowed_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://clipflow.pro",
-    "https://www.clipflow.pro",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
@@ -195,49 +162,6 @@ def complete_upload(req: CompleteUploadRequest):
     r.lpush("clipflow:jobs", req.upload_id)
 
     return {"status": "ok", "upload_id": req.upload_id}
-
-    # Insert DB row
-    with engine.begin() as conn:
-        conn.execute(
-            sa.text(
-                """
-                INSERT INTO uploads (id, user_id, original_filename, content_type, s3_key, bucket, status)
-                VALUES (:id, :user_id, :original_filename, :content_type, :s3_key, :bucket, 'created')
-                """
-            ),
-            {
-                "id": str(upload_id),
-                "user_id": req.user_id,
-                "original_filename": original_filename,
-                "content_type": content_type,
-                "s3_key": s3_key,
-                "bucket": S3_UPLOADS_BUCKET,
-            },
-        )
-
-    # Generate presigned PUT URL (valid 15 minutes)
-    presigned_url = s3.generate_presigned_url(
-        ClientMethod="put_object",
-        Params={
-            "Bucket": S3_UPLOADS_BUCKET,
-            "Key": s3_key,
-            "ContentType": content_type,
-        },
-        ExpiresIn=900,
-    )
-
-    # Queue a job ID in Redis (we'll build the worker later)
-    r.lpush("clipflow:jobs", str(upload_id))
-
-    return {
-        "upload_id": str(upload_id),
-        "bucket": S3_UPLOADS_BUCKET,
-        "s3_key": s3_key,
-        "content_type": content_type,
-        "presigned_url": presigned_url,
-        "status": "created",
-        "queued": True,
-    }
 
 @app.get("/api/uploads/recent")
 def recent_uploads(limit: int = 20):
