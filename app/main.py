@@ -10,35 +10,49 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Load environment variables from backend/.env
+# Load .env for local dev only; Render uses its own Environment settings
 load_dotenv()
 
-# --- App ---
+# -----------------------------
+# App
+# -----------------------------
 app = FastAPI(title="ClipFlow API")
+
+# -----------------------------
+# CORS
+# -----------------------------
+# Allow your Vercel domains + local dev.
+# Keep this list tight (not "*") since allow_credentials=True.
+ALLOWED_ORIGINS = [
+    "https://clipflow.pro",
+    "https://www.clipflow.pro",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://clipflow.pro",
-        "https://www.clipflow.pro",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Ensure all OPTIONS (preflight) requests succeed
 @app.options("/{path:path}")
-def preflight(path: str):
+def preflight_handler(path: str):
     return Response(status_code=204)
 
-# --- Env helpers ---
+
+# -----------------------------
+# Env helpers
+# -----------------------------
 def env_required(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
 
 DATABASE_URL = env_required("DATABASE_URL")
 REDIS_URL = env_required("REDIS_URL")
@@ -46,10 +60,15 @@ REDIS_URL = env_required("REDIS_URL")
 AWS_REGION = env_required("AWS_REGION")
 AWS_ACCESS_KEY_ID = env_required("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = env_required("AWS_SECRET_ACCESS_KEY")
-S3_UPLOADS_BUCKET = env_required("S3_UPLOADS_BUCKET")
-# S3_CLIPS_BUCKET not used yet in this file, but keep it in .env for later.
 
-# --- Clients ---
+S3_UPLOADS_BUCKET = env_required("S3_UPLOADS_BUCKET")
+# Keep this required so prod matches your intended setup (even if not used here yet)
+S3_CLIPS_BUCKET = env_required("S3_CLIPS_BUCKET")
+
+
+# -----------------------------
+# Clients
+# -----------------------------
 engine = sa.create_engine(DATABASE_URL, pool_pre_ping=True)
 r = redis.Redis.from_url(REDIS_URL)
 
@@ -60,16 +79,23 @@ s3 = boto3.client(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
 )
 
-# --- Models ---
+
+# -----------------------------
+# Models
+# -----------------------------
 class CreateUploadRequest(BaseModel):
     user_id: str
     original_filename: str
-    content_type: Optional[str] = None  # browser sometimes sends empty
+    content_type: Optional[str] = None
+
 
 class CompleteUploadRequest(BaseModel):
     upload_id: str
 
-# --- Routes ---
+
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/api/health")
 def health():
     # DB check
@@ -99,11 +125,12 @@ def health():
         "redis_error": redis_error,
     }
 
+
 @app.post("/api/uploads/create")
 def create_upload(req: CreateUploadRequest):
     upload_id = uuid.uuid4()
 
-    original_filename = req.original_filename.strip() or "upload.bin"
+    original_filename = (req.original_filename or "").strip() or "upload.bin"
     safe_name = original_filename.replace("\\", "_").replace("/", "_")
 
     content_type = (req.content_type or "").strip() or "application/octet-stream"
@@ -129,7 +156,7 @@ def create_upload(req: CreateUploadRequest):
             },
         )
 
-    # Generate presigned PUT URL
+    # Generate presigned PUT URL (15 minutes)
     presigned_url = s3.generate_presigned_url(
         ClientMethod="put_object",
         Params={
@@ -140,8 +167,6 @@ def create_upload(req: CreateUploadRequest):
         ExpiresIn=900,
     )
 
-    # Queue job
-
     return {
         "upload_id": str(upload_id),
         "bucket": S3_UPLOADS_BUCKET,
@@ -151,17 +176,22 @@ def create_upload(req: CreateUploadRequest):
         "status": "created",
         "queued": True,
     }
+
+
 @app.post("/api/uploads/complete")
 def complete_upload(req: CompleteUploadRequest):
+    # Mark uploaded
     with engine.begin() as conn:
         conn.execute(
             sa.text("UPDATE uploads SET status='uploaded' WHERE id = :id"),
             {"id": req.upload_id},
         )
+
     # Queue processing only AFTER upload is done
     r.lpush("clipflow:jobs", req.upload_id)
 
     return {"status": "ok", "upload_id": req.upload_id}
+
 
 @app.get("/api/uploads/recent")
 def recent_uploads(limit: int = 20):
@@ -178,7 +208,8 @@ def recent_uploads(limit: int = 20):
             {"limit": limit},
         ).mappings().all()
 
-    return {"uploads": [dict(r) for r in rows]}
+    return {"uploads": [dict(row) for row in rows]}
+
 
 @app.get("/api/uploads/{upload_id}/clips")
 def clips_for_upload(upload_id: str):
@@ -194,7 +225,9 @@ def clips_for_upload(upload_id: str):
             ),
             {"upload_id": upload_id},
         ).mappings().all()
-    return {"clips": [dict(r) for r in rows]}
+
+    return {"clips": [dict(row) for row in rows]}
+
 
 @app.get("/api/clips/{clip_id}/download")
 def clip_download(clip_id: str):
@@ -205,6 +238,7 @@ def clip_download(clip_id: str):
         ).mappings().first()
 
     if not row:
+        # Returning dict is fine for MVP; later we can use HTTPException(404)
         return {"error": "not_found"}
 
     url = s3.generate_presigned_url(
