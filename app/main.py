@@ -6,7 +6,7 @@ import boto3
 import redis
 import sqlalchemy as sa
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -61,6 +61,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.options("/{path:path}")
+def preflight(path: str):
+    return Response(status_code=204)
 
 # --- Env helpers ---
 def env_required(name: str) -> str:
