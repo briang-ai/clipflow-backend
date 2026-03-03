@@ -92,6 +92,9 @@ class CreateUploadRequest(BaseModel):
 class CompleteUploadRequest(BaseModel):
     upload_id: str
 
+class UpdateClipRequest(BaseModel):
+    player_name: Optional[str] = None
+    jersey_number: Optional[str] = None
 
 # -----------------------------
 # Routes
@@ -162,7 +165,6 @@ def create_upload(req: CreateUploadRequest):
         Params={
             "Bucket": S3_UPLOADS_BUCKET,
             "Key": s3_key,
-            "ContentType": content_type,
         },
         ExpiresIn=900,
     )
@@ -247,3 +249,38 @@ def clip_download(clip_id: str):
         ExpiresIn=900,
     )
     return {"download_url": url}
+
+@app.patch("/api/clips/{clip_id}")
+def update_clip(clip_id: str, req: UpdateClipRequest):
+    player_name = (req.player_name or "").strip() or None
+    jersey_number = (req.jersey_number or "").strip() or None
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                """
+                UPDATE clips
+                SET player_name = :player_name,
+                    jersey_number = :jersey_number
+                WHERE id = :id
+                """
+            ),
+            {"id": clip_id, "player_name": player_name, "jersey_number": jersey_number},
+        )
+
+        row = conn.execute(
+            sa.text(
+                """
+                SELECT id, upload_id, bucket, s3_key, start_sec, end_sec, label,
+                       player_name, jersey_number, created_at
+                FROM clips
+                WHERE id = :id
+                """
+            ),
+            {"id": clip_id},
+        ).mappings().first()
+
+    if not row:
+        return {"error": "not_found"}
+
+    return {"clip": dict(row)}
