@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 # --- Load env ---
 load_dotenv()
+print("WORKER VERSION: ai_v1", flush=True)
 
 def env_required(name: str) -> str:
     v = os.getenv(name)
@@ -318,8 +319,10 @@ def process_upload(upload_id: str):
 
             print(f"Segment {label}: start={start_sec} dur={seg_dur}", flush=True)
             run_ffmpeg_extract(source_path, clip_path, start_sec=start_sec, duration_sec=seg_dur)
+            print(f"ABOUT TO CALL AI FOR {label}", flush=True)
 
             is_hit, ai_confidence, ai_reason = classify_clip_with_ai(clip_path)
+            print(f"AI CALL RETURNED FOR {label}", flush=True)
             print(
                 f"AI RESULT {label}: is_hit={is_hit} confidence={ai_confidence} reason={ai_reason}",
                 flush=True,
