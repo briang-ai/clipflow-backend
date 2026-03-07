@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 "ANTHROPIC_KEY?", bool(os.getenv("ANTHROPIC_API_KEY")),
-"MODEL=", ANTHROPIC_MODEL,
 
 # Load .env for local dev only; Render uses its own Environment settings
 load_dotenv()
