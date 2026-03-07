@@ -229,8 +229,8 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
 
         # sample early / middle / late in the 5s segment
         extract_jpeg_frame(clip_path, frame1, 0.5)
-        extract_jpeg_frame(clip_path, frame2, 2.0)
-        extract_jpeg_frame(clip_path, frame3, 4.0)
+        extract_jpeg_frame(clip_path, frame2, 1.5)
+        extract_jpeg_frame(clip_path, frame3, 2.5)
 
         system_prompt = (
             "You classify youth baseball video segments for inclusion in a hitter highlight reel. "
@@ -268,6 +268,7 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
         print("AI RAW RESPONSE:", raw, flush=True)
 
         try:
+            raw = raw.replace("```json", "").replace("```", "").strip()
             data = json.loads(raw)
             is_hit = bool(data.get("is_hit"))
             confidence = float(data.get("confidence", 0.0))
