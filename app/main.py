@@ -142,6 +142,25 @@ def create_upload(req: CreateUploadRequest):
     content_type = (req.content_type or "").strip() or "application/octet-stream"
 
     s3_key = f"uploads/{req.user_id}/{upload_id}/{safe_name}"
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text(
+                """
+                SELECT COUNT(*) AS n
+                FROM uploads
+                WHERE user_id = :user_id
+                  AND created_at >= NOW() - INTERVAL '1 day'
+                """
+            ),
+            {"user_id": req.user_id},
+        ).mappings().first()
+
+    uploads_last_day = int(row["n"] or 0)
+    if uploads_last_day >= 10:
+        return {
+            "error": "upload_limit_reached",
+            "message": "Daily upload limit reached. Please try again tomorrow."
+        }
 
     # Insert DB row
     with engine.begin() as conn:
