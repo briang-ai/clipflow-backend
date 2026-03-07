@@ -155,7 +155,7 @@ def create_upload(req: CreateUploadRequest):
         ).mappings().first()
 
     uploads_last_day = int(row["n"] or 0)
-    if uploads_last_day >= 20:
+    if uploads_last_day >= 1000:
         return {
             "error": "upload_limit_reached",
             "message": "Daily upload limit reached. Please try again tomorrow."
