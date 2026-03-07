@@ -203,6 +203,8 @@ def extract_jpeg_frame(video_path: str, out_path: str, offset_sec: float):
     if p.returncode != 0:
         raise RuntimeError(f"frame extraction failed: {p.stderr or p.stdout}")
 
+    if not os.path.exists(out_path):
+        raise RuntimeError(f"frame extraction did not create file: {out_path}")
 
 def image_block_from_file(path: str) -> dict:
     with open(path, "rb") as f:
@@ -228,10 +230,19 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
         frame3 = os.path.join(tdir, "f3.jpg")
 
         # sample early / middle / late in the 5s segment
-        extract_jpeg_frame(clip_path, frame1, 0.5)
-        extract_jpeg_frame(clip_path, frame2, 1.5)
-        extract_jpeg_frame(clip_path, frame3, 2.5)
+        clip_duration = run_ffprobe_duration_seconds(clip_path)
 
+        # pick frames at ~20%, ~50%, and ~80% of the clip,
+        # but keep them slightly away from the exact end
+        t1 = max(0.1, round(clip_duration * 0.2, 3))
+        t2 = max(0.2, round(clip_duration * 0.5, 3))
+        t3 = max(0.3, round(min(clip_duration * 0.8, clip_duration - 0.2), 3))
+
+        print(f"Frame times for AI: {t1}, {t2}, {t3}", flush=True)
+
+        extract_jpeg_frame(clip_path, frame1, t1)
+        extract_jpeg_frame(clip_path, frame2, t2)
+        extract_jpeg_frame(clip_path, frame3, t3)
         system_prompt = (
             "You classify youth baseball video segments for inclusion in a hitter highlight reel. "
             "A 'hit' means the clip appears to show a batting highlight such as contact, ball in play off the bat, "
