@@ -10,6 +10,9 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+"ANTHROPIC_KEY?", bool(os.getenv("ANTHROPIC_API_KEY")),
+"MODEL=", ANTHROPIC_MODEL,
+
 # Load .env for local dev only; Render uses its own Environment settings
 load_dotenv()
 
@@ -212,6 +215,20 @@ def recent_uploads(limit: int = 20):
 
     return {"uploads": [dict(row) for row in rows]}
 
+@app.get("/api/debug/uploads/{upload_id}/counts")
+def debug_counts(upload_id: str):
+    with engine.connect() as conn:
+        upload = conn.execute(
+            sa.text("SELECT id, status FROM uploads WHERE id = :id"),
+            {"id": upload_id},
+        ).mappings().first()
+
+        clip_count = conn.execute(
+            sa.text("SELECT COUNT(*) AS n FROM clips WHERE upload_id = :id"),
+            {"id": upload_id},
+        ).mappings().first()
+
+    return {"upload": upload, "clip_count": int(clip_count["n"])}
 
 @app.get("/api/uploads/{upload_id}/clips")
 def clips_for_upload(upload_id: str):
@@ -219,7 +236,8 @@ def clips_for_upload(upload_id: str):
         rows = conn.execute(
             sa.text(
                 """
-                SELECT id, upload_id, bucket, s3_key, start_sec, end_sec, label, created_at
+                SELECT id, upload_id, bucket, s3_key, start_sec, end_sec, label,
+                       player_name, jersey_number, is_hit, ai_confidence, ai_reason, created_at
                 FROM clips
                 WHERE upload_id = :upload_id
                 ORDER BY created_at DESC
