@@ -1,6 +1,7 @@
+import json
 import os
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 import boto3
 import redis
@@ -23,8 +24,6 @@ app = FastAPI(title="ClipFlow API")
 # -----------------------------
 # CORS
 # -----------------------------
-# Allow your Vercel domains + local dev.
-# Keep this list tight (not "*") since allow_credentials=True.
 ALLOWED_ORIGINS = [
     "https://clipflow.pro",
     "https://www.clipflow.pro",
@@ -40,7 +39,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ensure all OPTIONS (preflight) requests succeed
 @app.options("/{path:path}")
 def preflight_handler(path: str):
     return Response(status_code=204)
@@ -57,15 +55,14 @@ def env_required(name: str) -> str:
 
 
 DATABASE_URL = env_required("DATABASE_URL")
-REDIS_URL = env_required("REDIS_URL")
+REDIS_URL    = env_required("REDIS_URL")
 
-AWS_REGION = env_required("AWS_REGION")
-AWS_ACCESS_KEY_ID = env_required("AWS_ACCESS_KEY_ID")
+AWS_REGION            = env_required("AWS_REGION")
+AWS_ACCESS_KEY_ID     = env_required("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = env_required("AWS_SECRET_ACCESS_KEY")
 
 S3_UPLOADS_BUCKET = env_required("S3_UPLOADS_BUCKET")
-# Keep this required so prod matches your intended setup (even if not used here yet)
-S3_CLIPS_BUCKET = env_required("S3_CLIPS_BUCKET")
+S3_CLIPS_BUCKET   = env_required("S3_CLIPS_BUCKET")
 
 
 # -----------------------------
@@ -90,7 +87,6 @@ class CreateUploadRequest(BaseModel):
     original_filename: str
     content_type: Optional[str] = None
 
-
 class CompleteUploadRequest(BaseModel):
     upload_id: str
 
@@ -98,12 +94,16 @@ class UpdateClipRequest(BaseModel):
     player_name: Optional[str] = None
     jersey_number: Optional[str] = None
 
+class CompileReelRequest(BaseModel):
+    upload_id: str
+    clip_ids: List[str]
+
+
 # -----------------------------
-# Routes
+# Routes — health
 # -----------------------------
 @app.get("/api/health")
 def health():
-    # DB check
     db_ok = False
     db_error = None
     try:
@@ -113,7 +113,6 @@ def health():
     except Exception as e:
         db_error = str(e)
 
-    # Redis check
     redis_ok = False
     redis_error = None
     try:
@@ -131,45 +130,41 @@ def health():
     }
 
 
+# -----------------------------
+# Routes — uploads
+# -----------------------------
 @app.post("/api/uploads/create")
 def create_upload(req: CreateUploadRequest):
     upload_id = uuid.uuid4()
 
     original_filename = (req.original_filename or "").strip() or "upload.bin"
     safe_name = original_filename.replace("\\", "_").replace("/", "_")
-
     content_type = (req.content_type or "").strip() or "application/octet-stream"
-
     s3_key = f"uploads/{req.user_id}/{upload_id}/{safe_name}"
+
     with engine.connect() as conn:
         row = conn.execute(
-            sa.text(
-                """
+            sa.text("""
                 SELECT COUNT(*) AS n
                 FROM uploads
                 WHERE user_id = :user_id
                   AND created_at >= NOW() - INTERVAL '1 day'
-                """
-            ),
+            """),
             {"user_id": req.user_id},
         ).mappings().first()
 
-    uploads_last_day = int(row["n"] or 0)
-    if uploads_last_day >= 20:
+    if int(row["n"] or 0) >= 20:
         return {
             "error": "upload_limit_reached",
-            "message": "Daily upload limit reached. Please try again tomorrow."
+            "message": "Daily upload limit reached. Please try again tomorrow.",
         }
 
-    # Insert DB row
     with engine.begin() as conn:
         conn.execute(
-            sa.text(
-                """
+            sa.text("""
                 INSERT INTO uploads (id, user_id, original_filename, content_type, s3_key, bucket, status)
                 VALUES (:id, :user_id, :original_filename, :content_type, :s3_key, :bucket, 'created')
-                """
-            ),
+            """),
             {
                 "id": str(upload_id),
                 "user_id": req.user_id,
@@ -180,13 +175,9 @@ def create_upload(req: CreateUploadRequest):
             },
         )
 
-    # Generate presigned PUT URL (15 minutes)
     presigned_url = s3.generate_presigned_url(
         ClientMethod="put_object",
-        Params={
-            "Bucket": S3_UPLOADS_BUCKET,
-            "Key": s3_key,
-        },
+        Params={"Bucket": S3_UPLOADS_BUCKET, "Key": s3_key},
         ExpiresIn=900,
     )
 
@@ -203,16 +194,12 @@ def create_upload(req: CreateUploadRequest):
 
 @app.post("/api/uploads/complete")
 def complete_upload(req: CompleteUploadRequest):
-    # Mark uploaded
     with engine.begin() as conn:
         conn.execute(
             sa.text("UPDATE uploads SET status='uploaded' WHERE id = :id"),
             {"id": req.upload_id},
         )
-
-    # Queue processing only AFTER upload is done
     r.lpush("clipflow:jobs", req.upload_id)
-
     return {"status": "ok", "upload_id": req.upload_id}
 
 
@@ -220,18 +207,16 @@ def complete_upload(req: CompleteUploadRequest):
 def recent_uploads(limit: int = 20):
     with engine.connect() as conn:
         rows = conn.execute(
-            sa.text(
-                """
+            sa.text("""
                 SELECT id, user_id, original_filename, content_type, s3_key, bucket, status, created_at
                 FROM uploads
                 ORDER BY created_at DESC
                 LIMIT :limit
-                """
-            ),
+            """),
             {"limit": limit},
         ).mappings().all()
-
     return {"uploads": [dict(row) for row in rows]}
+
 
 @app.get("/api/debug/uploads/{upload_id}/counts")
 def debug_counts(upload_id: str):
@@ -240,33 +225,54 @@ def debug_counts(upload_id: str):
             sa.text("SELECT id, status FROM uploads WHERE id = :id"),
             {"id": upload_id},
         ).mappings().first()
-
         clip_count = conn.execute(
             sa.text("SELECT COUNT(*) AS n FROM clips WHERE upload_id = :id"),
             {"id": upload_id},
         ).mappings().first()
-
     return {"upload": upload, "clip_count": int(clip_count["n"])}
+
 
 @app.get("/api/uploads/{upload_id}/clips")
 def clips_for_upload(upload_id: str):
     with engine.connect() as conn:
         rows = conn.execute(
-            sa.text(
-                """
+            sa.text("""
                 SELECT id, upload_id, bucket, s3_key, start_sec, end_sec, label,
                        player_name, jersey_number, is_hit, ai_confidence, ai_reason, created_at
                 FROM clips
                 WHERE upload_id = :upload_id
                 ORDER BY created_at DESC
-                """
-            ),
+            """),
             {"upload_id": upload_id},
         ).mappings().all()
-
     return {"clips": [dict(row) for row in rows]}
 
 
+# -----------------------------------------------------------------------
+# GET /api/uploads/{upload_id}/reels
+# Returns all reels compiled from clips belonging to this upload,
+# ordered newest first.
+# -----------------------------------------------------------------------
+@app.get("/api/uploads/{upload_id}/reels")
+def reels_for_upload(upload_id: str):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT r.id, r.user_id, r.player_name, r.jersey_number,
+                       r.game_date, r.clip_count, r.duration_sec,
+                       r.status, r.error_message, r.s3_key, r.created_at
+                FROM   reels r
+                WHERE  r.upload_id = :upload_id
+                ORDER  BY r.created_at DESC
+            """),
+            {"upload_id": upload_id},
+        ).mappings().all()
+    return {"reels": [dict(row) for row in rows]}
+
+
+# -----------------------------
+# Routes — clips
+# -----------------------------
 @app.get("/api/clips/{clip_id}/download")
 def clip_download(clip_id: str):
     with engine.connect() as conn:
@@ -276,7 +282,6 @@ def clip_download(clip_id: str):
         ).mappings().first()
 
     if not row:
-        # Returning dict is fine for MVP; later we can use HTTPException(404)
         return {"error": "not_found"}
 
     url = s3.generate_presigned_url(
@@ -286,37 +291,141 @@ def clip_download(clip_id: str):
     )
     return {"download_url": url}
 
+
 @app.patch("/api/clips/{clip_id}")
 def update_clip(clip_id: str, req: UpdateClipRequest):
-    player_name = (req.player_name or "").strip() or None
+    player_name   = (req.player_name   or "").strip() or None
     jersey_number = (req.jersey_number or "").strip() or None
 
     with engine.begin() as conn:
         conn.execute(
-            sa.text(
-                """
+            sa.text("""
                 UPDATE clips
-                SET player_name = :player_name,
+                SET player_name   = :player_name,
                     jersey_number = :jersey_number
                 WHERE id = :id
-                """
-            ),
+            """),
             {"id": clip_id, "player_name": player_name, "jersey_number": jersey_number},
         )
-
         row = conn.execute(
-            sa.text(
-                """
+            sa.text("""
                 SELECT id, upload_id, bucket, s3_key, start_sec, end_sec, label,
                        player_name, jersey_number, created_at
-                FROM clips
-                WHERE id = :id
-                """
-            ),
+                FROM clips WHERE id = :id
+            """),
             {"id": clip_id},
         ).mappings().first()
 
     if not row:
         return {"error": "not_found"}
-
     return {"clip": dict(row)}
+
+
+# -----------------------------
+# Routes — reels
+# -----------------------------
+
+# -----------------------------------------------------------------------
+# POST /api/reels/compile
+# Creates a reel record and enqueues a compile_reel worker job.
+#
+# Body: { upload_id, clip_ids: [...] }
+#
+# The worker resolves player_name / jersey_number from the clips table
+# itself, so we don't require the frontend to pass them.  game_date is
+# derived from the upload's created_at date (same logic the worker uses
+# to group clips by game day).
+# -----------------------------------------------------------------------
+@app.post("/api/reels/compile")
+def compile_reel(req: CompileReelRequest):
+    if not req.clip_ids:
+        return {"error": "no_clips", "message": "clip_ids must not be empty"}
+
+    # Resolve player info + game date from the clips / upload in DB
+    with engine.connect() as conn:
+        # Pull the most common player_name / jersey_number across the
+        # provided clips so the reel is labelled correctly.
+        player_row = conn.execute(
+            sa.text("""
+                SELECT player_name, jersey_number
+                FROM   clips
+                WHERE  id = ANY(:ids)
+                  AND  player_name IS NOT NULL
+                GROUP  BY player_name, jersey_number
+                ORDER  BY COUNT(*) DESC
+                LIMIT  1
+            """),
+            {"ids": req.clip_ids},
+        ).mappings().first()
+
+        upload_row = conn.execute(
+            sa.text("SELECT user_id, created_at FROM uploads WHERE id = :id"),
+            {"id": req.upload_id},
+        ).mappings().first()
+
+    if not upload_row:
+        return {"error": "upload_not_found"}
+
+    player_name   = player_row["player_name"]   if player_row else "Unknown"
+    jersey_number = player_row["jersey_number"] if player_row else None
+    game_date     = upload_row["created_at"].date()
+    user_id       = upload_row["user_id"]
+    reel_id       = str(uuid.uuid4())
+
+    # Insert reel row with status='pending'
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("""
+                INSERT INTO reels
+                    (id, user_id, upload_id, player_name, jersey_number,
+                     game_date, status, clip_count)
+                VALUES
+                    (:id, :user_id, :upload_id, :player_name, :jersey_number,
+                     :game_date, 'pending', :clip_count)
+            """),
+            {
+                "id":            reel_id,
+                "user_id":       user_id,
+                "upload_id":     req.upload_id,
+                "player_name":   player_name,
+                "jersey_number": jersey_number,
+                "game_date":     game_date,
+                "clip_count":    len(req.clip_ids),
+            },
+        )
+
+    # Enqueue worker job as JSON so the worker can distinguish it from
+    # legacy plain-string upload jobs
+    job_payload = json.dumps({
+        "type":      "compile_reel",
+        "reel_id":   reel_id,
+        "clip_ids":  req.clip_ids,
+    })
+    r.lpush("clipflow:jobs", job_payload)
+
+    return {"status": "queued", "reel_id": reel_id}
+
+
+# -----------------------------------------------------------------------
+# GET /api/reels/{reel_id}/download
+# Returns a short-lived presigned S3 URL for the finished reel file.
+# -----------------------------------------------------------------------
+@app.get("/api/reels/{reel_id}/download")
+def reel_download(reel_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT status, s3_key FROM reels WHERE id = :id"),
+            {"id": reel_id},
+        ).mappings().first()
+
+    if not row:
+        return {"error": "not_found"}
+    if row["status"] != "complete":
+        return {"error": "not_ready", "status": row["status"]}
+
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_CLIPS_BUCKET, "Key": row["s3_key"]},
+        ExpiresIn=900,
+    )
+    return {"download_url": url}
