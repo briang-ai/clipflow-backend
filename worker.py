@@ -221,35 +221,22 @@ def image_block_from_file(path: str) -> dict:
     }
 
 
-def shrink_clip_for_ai(source_path: str, out_path: str, max_mb: float = 4.5):
+def extract_frames_for_ai(clip_path: str, tdir: str, clip_duration: float, count: int = 10) -> list[str]:
     """
-    Re-encode the clip to a small size suitable for base64 sending to Claude.
-    Targets ~360p, high CRF, low fps — enough for visual analysis.
+    Extract evenly-spaced JPEG frames from a clip for AI analysis.
+    Denser sampling = better chance of catching the contact moment.
     """
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", source_path,
-        "-vf", "scale=-2:360",
-        "-r", "10",           # 10fps — plenty for motion analysis
-        "-crf", "35",
-        "-preset", "veryfast",
-        "-c:a", "aac",
-        "-b:a", "32k",
-        "-ac", "1",
-        out_path,
+    frame_times = [
+        min(max(0.1, round(clip_duration * (i / (count - 1)), 3)), clip_duration - 0.1)
+        for i in range(count)
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"shrink_clip_for_ai failed: {p.stderr or p.stdout}")
-
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    print(f"Shrunk clip size: {size_mb:.2f} MB", flush=True)
-
-    if size_mb > max_mb:
-        raise RuntimeError(
-            f"Shrunk clip still too large ({size_mb:.2f} MB > {max_mb} MB). "
-            "Consider reducing CLIP_SECONDS."
-        )
+    frame_paths = []
+    for i, t in enumerate(frame_times):
+        fp = os.path.join(tdir, f"f{i+1:02d}.jpg")
+        extract_jpeg_frame(clip_path, fp, t)
+        frame_paths.append(fp)
+    print(f"Extracted {count} frames at times: {frame_times}", flush=True)
+    return frame_paths
 
 
 def get_audio_features(video_path: str) -> str:
@@ -306,15 +293,13 @@ def get_audio_features(video_path: str) -> str:
 def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, str | None]:
     """
     Returns (is_hit, confidence, reason).
-
-    Primary strategy: send the actual video to Claude as base64 so it can
-    analyze true motion, swing arc, bat drop, and ball trajectory — not just
-    static frames. Falls back to 8-frame analysis if the clip is too large.
+    Uses 10 evenly-spaced frames + audio transient analysis.
+    Denser frame sampling dramatically improves contact detection vs 3 frames.
     """
     with tempfile.TemporaryDirectory() as tdir:
         clip_duration = run_ffprobe_duration_seconds(clip_path)
 
-        # --- Audio features (always collected regardless of video strategy) ---
+        # --- Audio features ---
         audio_summary = "Audio analysis unavailable."
         try:
             audio_summary = get_audio_features(clip_path)
@@ -322,16 +307,8 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
         except Exception as e:
             print(f"Audio feature extraction skipped: {e}", flush=True)
 
-        # --- Try video strategy first ---
-        video_b64 = None
-        small_clip_path = os.path.join(tdir, "small.mp4")
-        try:
-            shrink_clip_for_ai(clip_path, small_clip_path, max_mb=MAX_VIDEO_MB)
-            with open(small_clip_path, "rb") as f:
-                video_b64 = base64.b64encode(f.read()).decode("utf-8")
-            print("Using VIDEO strategy for AI classification.", flush=True)
-        except Exception as e:
-            print(f"Video strategy unavailable ({e}), falling back to frames.", flush=True)
+        # --- Extract 10 frames ---
+        frame_paths = extract_frames_for_ai(clip_path, tdir, clip_duration, count=10)
 
         system_prompt = (
             "You are an expert baseball video analyst specializing in youth Little League games. "
@@ -346,80 +323,44 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
             "- Batter running the bases (already past contact moment)\n\n"
 
             "STRONG indicators a clip is NOT a hit (is_hit=false):\n"
-            "- Batter standing still waiting for a pitch (no swing)\n"
-            "- Swing and miss — bat completes arc with no contact, ball reaches catcher\n"
-            "- Pitcher in wind-up with no batter action visible\n"
+            "- Batter standing still waiting for a pitch with no swing initiated\n"
+            "- Swing and miss — bat completes full arc, ball reaches catcher glove\n"
+            "- Pitcher in wind-up with no batter swing visible\n"
             "- Dead time between pitches — batter stepping out, coach visit, timeout\n"
             "- Pure fielding play with no batter involvement\n"
             "- Batter remains in box holding bat after pitch (called strike or ball)\n\n"
 
-            "Key signals to weight heavily:\n"
-            "1. BAT DROP + IMMEDIATE RUN = almost certain hit. This is the strongest single signal.\n"
-            "2. SHARP AUDIO TRANSIENT at swing moment = strong bat-crack indicator.\n"
-            "3. BALL TRAJECTORY CHANGE = ball visibly redirected off bat.\n"
-            "4. FOLLOW-THROUGH SWING POSTURE vs. checked/incomplete swing.\n\n"
+            "Key signals ranked by importance:\n"
+            "1. BAT DROP + IMMEDIATE RUN = almost certain hit. Strongest single signal.\n"
+            "2. BALL VISIBLE IN FLIGHT off bat = confirmed contact.\n"
+            "3. SHARP AUDIO TRANSIENT at swing moment = bat-crack indicator.\n"
+            "4. FOLLOW-THROUGH swing posture vs checked/incomplete swing.\n"
+            "5. FIELDER REACTION to a live ball.\n\n"
 
-            "When uncertain, lean toward is_hit=false to avoid false positives. "
-            "But if bat drop + running is visible, override uncertainty and call it a hit. "
+            "IMPORTANT: A batter standing at the plate ready to hit is NOT a hit — "
+            "you must see the swing AND evidence of contact or its result. "
+            "Being at the plate in an active at-bat alone is NOT sufficient for is_hit=true. "
             "Return strict JSON only."
         )
 
-        if video_b64:
-            # ---- VIDEO PATH ----
-            user_text = (
-                f"Here is a {clip_duration:.1f}-second youth baseball video clip. "
-                "Watch for the full motion sequence: pitch arrival, batter swing, "
-                "bat-ball contact, ball trajectory, bat drop, and runner movement.\n\n"
-                f"Audio analysis: {audio_summary}\n\n"
-                "Return ONLY this JSON:\n"
-                "{\n"
-                "  \"is_hit\": true or false,\n"
-                "  \"confidence\": 0.0 to 1.0,\n"
-                "  \"reason\": \"1-2 sentences citing specific motion/audio evidence you observed\"\n"
-                "}"
-            )
-            content: list[dict] = [
-                {"type": "text", "text": user_text},
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "video/mp4",
-                        "data": video_b64,
-                    },
-                },
-            ]
-        else:
-            # ---- FRAME FALLBACK: 8 frames for longer/larger clips ----
-            frame_count = 8
-            frame_times = [
-                min(max(0.1, round(clip_duration * (i / (frame_count - 1)), 3)), clip_duration - 0.1)
-                for i in range(frame_count)
-            ]
-            frame_paths = []
-            for i, t in enumerate(frame_times):
-                fp = os.path.join(tdir, f"f{i+1}.jpg")
-                extract_jpeg_frame(clip_path, fp, t)
-                frame_paths.append(fp)
-            print(f"Frame fallback — times: {frame_times}", flush=True)
+        user_text = (
+            f"Here are 10 sequential frames from a {clip_duration:.1f}-second youth baseball clip, "
+            "evenly spaced from start to end. Treat them as a flip-book — analyze motion "
+            "across the sequence.\n\n"
+            "Look for: swing initiation → contact moment → follow-through → bat drop → running. "
+            "A batter simply standing at the plate ready to swing is NOT a hit.\n\n"
+            f"Audio analysis: {audio_summary}\n\n"
+            "Return ONLY this JSON:\n"
+            "{\n"
+            "  \"is_hit\": true or false,\n"
+            "  \"confidence\": 0.0 to 1.0,\n"
+            "  \"reason\": \"1-2 sentences citing specific visual evidence across frames\"\n"
+            "}"
+        )
 
-            user_text = (
-                f"Here are {frame_count} sequential frames from a {clip_duration:.1f}-second "
-                "youth baseball clip, evenly spaced from start to end.\n\n"
-                "Analyze as a motion sequence — look for swing arc progression across frames, "
-                "bat drop between frames, player starting to run, ball trajectory change, "
-                "and fielder reactions.\n\n"
-                f"Audio analysis: {audio_summary}\n\n"
-                "Return ONLY this JSON:\n"
-                "{\n"
-                "  \"is_hit\": true or false,\n"
-                "  \"confidence\": 0.0 to 1.0,\n"
-                "  \"reason\": \"1-2 sentences citing specific visual/audio evidence\"\n"
-                "}"
-            )
-            content = [{"type": "text", "text": user_text}]
-            for fp in frame_paths:
-                content.append(image_block_from_file(fp))
+        content: list[dict] = [{"type": "text", "text": user_text}]
+        for fp in frame_paths:
+            content.append(image_block_from_file(fp))
 
         resp = anthropic.messages.create(
             model=ANTHROPIC_MODEL,
