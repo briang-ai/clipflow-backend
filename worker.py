@@ -36,7 +36,7 @@ S3_UPLOADS_BUCKET = env_required("S3_UPLOADS_BUCKET")
 S3_CLIPS_BUCKET = env_required("S3_CLIPS_BUCKET")
 
 ANTHROPIC_API_KEY = env_required("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.70"))
 
 # --- Tuning ---
@@ -381,7 +381,7 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
             content: list[dict] = [
                 {"type": "text", "text": user_text},
                 {
-                    "type": "document",
+                    "type": "image",
                     "source": {
                         "type": "base64",
                         "media_type": "video/mp4",
