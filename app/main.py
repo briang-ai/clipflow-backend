@@ -349,7 +349,7 @@ def compile_reel(req: CompileReelRequest):
             sa.text("""
                 SELECT player_name, jersey_number
                 FROM   clips
-                WHERE  id = ANY(:ids)
+                WHERE  id = ANY(:ids::uuid[])
                   AND  player_name IS NOT NULL
                 GROUP  BY player_name, jersey_number
                 ORDER  BY COUNT(*) DESC
