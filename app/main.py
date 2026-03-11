@@ -11,8 +11,6 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-"ANTHROPIC_KEY?", bool(os.getenv("ANTHROPIC_API_KEY")),
-
 # Load .env for local dev only; Render uses its own Environment settings
 load_dotenv()
 
@@ -272,7 +270,6 @@ def reels_for_upload(upload_id: str):
 # DELETE /api/uploads/bulk
 # Must be registered BEFORE /api/uploads/{upload_id} so FastAPI doesn't
 # match "bulk" as an upload_id path param.
-# Body: { "upload_ids": ["id1", "id2", ...] }
 # -----------------------------------------------------------------------
 @app.delete("/api/uploads/bulk")
 def bulk_delete_uploads(req: BulkDeleteRequest):
@@ -294,11 +291,6 @@ def bulk_delete_uploads(req: BulkDeleteRequest):
     return {"deleted": deleted, "errors": errors}
 
 
-# -----------------------------------------------------------------------
-# DELETE /api/uploads/{upload_id}
-# Deletes the upload record, all associated clips, any associated reels,
-# and the corresponding S3 objects.
-# -----------------------------------------------------------------------
 def _delete_upload(upload_id: str):
     """Core delete logic, callable internally and from the HTTP handler."""
     with engine.connect() as conn:
@@ -320,7 +312,6 @@ def _delete_upload(upload_id: str):
             {"id": upload_id},
         ).mappings().all()
 
-    # ── Delete S3 objects (failures are logged but don't abort DB cleanup) ──
     def delete_s3_key(bucket: str, key: str):
         try:
             if bucket and key:
@@ -335,7 +326,6 @@ def _delete_upload(upload_id: str):
         if reel["s3_key"]:
             delete_s3_key(S3_CLIPS_BUCKET, reel["s3_key"])
 
-    # ── Delete DB rows ───────────────────────────────────────────────────────
     with engine.begin() as conn:
         conn.execute(sa.text("DELETE FROM clips WHERE upload_id = :id"), {"id": upload_id})
         conn.execute(sa.text("DELETE FROM reels WHERE upload_id = :id"), {"id": upload_id})
@@ -457,9 +447,13 @@ def compile_reel(req: CompileReelRequest):
         )
 
     job_payload = json.dumps({
-        "type":     "compile_reel",
-        "reel_id":  reel_id,
-        "clip_ids": req.clip_ids,
+        "type":          "compile_reel",
+        "reel_id":       reel_id,
+        "user_id":       user_id,
+        "player_name":   player_name,
+        "jersey_number": jersey_number or "",
+        "game_date":     game_date.isoformat(),
+        "clip_ids":      req.clip_ids,
     })
     r.lpush("clipflow:jobs", job_payload)
 
