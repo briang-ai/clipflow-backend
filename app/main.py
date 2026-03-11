@@ -7,7 +7,7 @@ import boto3
 import redis
 import sqlalchemy as sa
 from dotenv import load_dotenv
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -97,6 +97,9 @@ class UpdateClipRequest(BaseModel):
 class CompileReelRequest(BaseModel):
     upload_id: str
     clip_ids: List[str]
+
+class BulkDeleteRequest(BaseModel):
+    upload_ids: List[str]
 
 
 # -----------------------------
@@ -248,11 +251,6 @@ def clips_for_upload(upload_id: str):
     return {"clips": [dict(row) for row in rows]}
 
 
-# -----------------------------------------------------------------------
-# GET /api/uploads/{upload_id}/reels
-# Returns all reels compiled from clips belonging to this upload,
-# ordered newest first.
-# -----------------------------------------------------------------------
 @app.get("/api/uploads/{upload_id}/reels")
 def reels_for_upload(upload_id: str):
     with engine.connect() as conn:
@@ -268,6 +266,86 @@ def reels_for_upload(upload_id: str):
             {"upload_id": upload_id},
         ).mappings().all()
     return {"reels": [dict(row) for row in rows]}
+
+
+# -----------------------------------------------------------------------
+# DELETE /api/uploads/bulk
+# Must be registered BEFORE /api/uploads/{upload_id} so FastAPI doesn't
+# match "bulk" as an upload_id path param.
+# Body: { "upload_ids": ["id1", "id2", ...] }
+# -----------------------------------------------------------------------
+@app.delete("/api/uploads/bulk")
+def bulk_delete_uploads(req: BulkDeleteRequest):
+    if not req.upload_ids:
+        return {"deleted": [], "errors": []}
+
+    deleted = []
+    errors = []
+
+    for upload_id in req.upload_ids:
+        try:
+            _delete_upload(upload_id)
+            deleted.append(upload_id)
+        except HTTPException as e:
+            errors.append({"upload_id": upload_id, "error": e.detail})
+        except Exception as e:
+            errors.append({"upload_id": upload_id, "error": str(e)})
+
+    return {"deleted": deleted, "errors": errors}
+
+
+# -----------------------------------------------------------------------
+# DELETE /api/uploads/{upload_id}
+# Deletes the upload record, all associated clips, any associated reels,
+# and the corresponding S3 objects.
+# -----------------------------------------------------------------------
+def _delete_upload(upload_id: str):
+    """Core delete logic, callable internally and from the HTTP handler."""
+    with engine.connect() as conn:
+        upload = conn.execute(
+            sa.text("SELECT s3_key, bucket FROM uploads WHERE id = :id"),
+            {"id": upload_id},
+        ).mappings().first()
+
+        if not upload:
+            raise HTTPException(status_code=404, detail="Upload not found")
+
+        clip_rows = conn.execute(
+            sa.text("SELECT s3_key, bucket FROM clips WHERE upload_id = :id"),
+            {"id": upload_id},
+        ).mappings().all()
+
+        reel_rows = conn.execute(
+            sa.text("SELECT s3_key FROM reels WHERE upload_id = :id"),
+            {"id": upload_id},
+        ).mappings().all()
+
+    # ── Delete S3 objects (failures are logged but don't abort DB cleanup) ──
+    def delete_s3_key(bucket: str, key: str):
+        try:
+            if bucket and key:
+                s3.delete_object(Bucket=bucket, Key=key)
+        except Exception as e:
+            print(f"[delete_upload] S3 delete failed for {key}: {e}")
+
+    delete_s3_key(upload["bucket"], upload["s3_key"])
+    for clip in clip_rows:
+        delete_s3_key(clip["bucket"], clip["s3_key"])
+    for reel in reel_rows:
+        if reel["s3_key"]:
+            delete_s3_key(S3_CLIPS_BUCKET, reel["s3_key"])
+
+    # ── Delete DB rows ───────────────────────────────────────────────────────
+    with engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM clips WHERE upload_id = :id"), {"id": upload_id})
+        conn.execute(sa.text("DELETE FROM reels WHERE upload_id = :id"), {"id": upload_id})
+        conn.execute(sa.text("DELETE FROM uploads WHERE id = :id"),      {"id": upload_id})
+
+
+@app.delete("/api/uploads/{upload_id}")
+def delete_upload(upload_id: str):
+    _delete_upload(upload_id)
+    return {"deleted": True, "upload_id": upload_id}
 
 
 # -----------------------------
@@ -324,27 +402,12 @@ def update_clip(clip_id: str, req: UpdateClipRequest):
 # -----------------------------
 # Routes — reels
 # -----------------------------
-
-# -----------------------------------------------------------------------
-# POST /api/reels/compile
-# Creates a reel record and enqueues a compile_reel worker job.
-#
-# Body: { upload_id, clip_ids: [...] }
-#
-# The worker resolves player_name / jersey_number from the clips table
-# itself, so we don't require the frontend to pass them.  game_date is
-# derived from the upload's created_at date (same logic the worker uses
-# to group clips by game day).
-# -----------------------------------------------------------------------
 @app.post("/api/reels/compile")
 def compile_reel(req: CompileReelRequest):
     if not req.clip_ids:
         return {"error": "no_clips", "message": "clip_ids must not be empty"}
 
-    # Resolve player info + game date from the clips / upload in DB
     with engine.connect() as conn:
-        # Pull the most common player_name / jersey_number across the
-        # provided clips so the reel is labelled correctly.
         player_row = conn.execute(
             sa.text("""
                 SELECT player_name, jersey_number
@@ -372,7 +435,6 @@ def compile_reel(req: CompileReelRequest):
     user_id       = upload_row["user_id"]
     reel_id       = str(uuid.uuid4())
 
-    # Insert reel row with status='pending'
     with engine.begin() as conn:
         conn.execute(
             sa.text("""
@@ -394,22 +456,16 @@ def compile_reel(req: CompileReelRequest):
             },
         )
 
-    # Enqueue worker job as JSON so the worker can distinguish it from
-    # legacy plain-string upload jobs
     job_payload = json.dumps({
-        "type":      "compile_reel",
-        "reel_id":   reel_id,
-        "clip_ids":  req.clip_ids,
+        "type":     "compile_reel",
+        "reel_id":  reel_id,
+        "clip_ids": req.clip_ids,
     })
     r.lpush("clipflow:jobs", job_payload)
 
     return {"status": "queued", "reel_id": reel_id}
 
 
-# -----------------------------------------------------------------------
-# GET /api/reels/{reel_id}/download
-# Returns a short-lived presigned S3 URL for the finished reel file.
-# -----------------------------------------------------------------------
 @app.get("/api/reels/{reel_id}/download")
 def reel_download(reel_id: str):
     with engine.connect() as conn:
