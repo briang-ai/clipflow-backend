@@ -459,6 +459,27 @@ def compile_reel(req: CompileReelRequest):
 
     return {"status": "queued", "reel_id": reel_id}
 
+@app.delete("/api/reels/{reel_id}")
+def delete_reel(reel_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT s3_key FROM reels WHERE id = :id"),
+            {"id": reel_id},
+        ).mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Reel not found")
+
+    if row["s3_key"]:
+        try:
+            s3.delete_object(Bucket=S3_CLIPS_BUCKET, Key=row["s3_key"])
+        except Exception as e:
+            print(f"[delete_reel] S3 delete failed: {e}")
+
+    with engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM reels WHERE id = :id"), {"id": reel_id})
+
+    return {"deleted": True, "reel_id": reel_id}
 
 @app.get("/api/reels/{reel_id}/download")
 def reel_download(reel_id: str):
