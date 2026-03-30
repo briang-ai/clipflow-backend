@@ -532,6 +532,37 @@ def delete_reel(reel_id: str):
     return {"deleted": True, "reel_id": reel_id}
 
 
+@app.get("/api/reels/{reel_id}/public")
+def reel_public(reel_id: str):
+    """Public endpoint — no auth required. Used for share page."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("""
+                SELECT id, player_name, jersey_number, game_date,
+                       clip_count, duration_sec, status, s3_key
+                FROM reels WHERE id = :id
+            """),
+            {"id": reel_id},
+        ).mappings().first()
+
+    if not row or row["status"] != "complete":
+        return {"error": "not_found"}
+
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_CLIPS_BUCKET, "Key": row["s3_key"]},
+        ExpiresIn=3600,
+    )
+    return {
+        "player_name":   row["player_name"],
+        "jersey_number": row["jersey_number"],
+        "game_date":     str(row["game_date"]),
+        "clip_count":    row["clip_count"],
+        "duration_sec":  row["duration_sec"],
+        "video_url":     url,
+    }
+
+
 @app.get("/api/reels/{reel_id}/download")
 def reel_download(reel_id: str):
     with engine.connect() as conn:
@@ -632,7 +663,7 @@ async def admin_users(
         rows = conn.execute(sa.text("""
             SELECT
                 user_id,
-                COUNT(*)       AS upload_count,
+                COUNT(*)        AS upload_count,
                 MAX(created_at) AS last_upload_at
             FROM uploads
             GROUP BY user_id
