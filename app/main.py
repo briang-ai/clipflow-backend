@@ -4,10 +4,11 @@ import uuid
 from typing import List, Optional
 
 import boto3
+import httpx
 import redis
 import sqlalchemy as sa
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -62,6 +63,9 @@ AWS_SECRET_ACCESS_KEY = env_required("AWS_SECRET_ACCESS_KEY")
 S3_UPLOADS_BUCKET = env_required("S3_UPLOADS_BUCKET")
 S3_CLIPS_BUCKET   = env_required("S3_CLIPS_BUCKET")
 
+CLERK_SECRET_KEY = env_required("CLERK_SECRET_KEY")
+ADMIN_SECRET     = env_required("ADMIN_SECRET")
+
 
 # -----------------------------
 # Clients
@@ -98,6 +102,54 @@ class CompileReelRequest(BaseModel):
 
 class BulkDeleteRequest(BaseModel):
     upload_ids: List[str]
+
+
+# -----------------------------
+# Admin helpers
+# -----------------------------
+async def _assert_clerk_admin(user_id: str | None):
+    """Verify the given Clerk user_id has role=admin in privateMetadata."""
+    if not user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"https://api.clerk.com/v1/users/{user_id}",
+            headers={"Authorization": f"Bearer {CLERK_SECRET_KEY}"},
+        )
+    if res.status_code != 200:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    meta = res.json().get("private_metadata", {})
+    if meta.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+async def _fetch_clerk_users(user_ids: list[str]) -> dict[str, dict]:
+    """Fetch name + primary email for a list of Clerk user IDs."""
+    results = {}
+    async with httpx.AsyncClient() as client:
+        for uid in user_ids:
+            try:
+                res = await client.get(
+                    f"https://api.clerk.com/v1/users/{uid}",
+                    headers={"Authorization": f"Bearer {CLERK_SECRET_KEY}"},
+                )
+                if res.status_code != 200:
+                    continue
+                data = res.json()
+                primary_email = next(
+                    (e["email_address"] for e in data.get("email_addresses", [])
+                     if e["id"] == data.get("primary_email_address_id")),
+                    "",
+                )
+                first = data.get("first_name") or ""
+                last  = data.get("last_name")  or ""
+                results[uid] = {
+                    "email": primary_email,
+                    "name":  f"{first} {last}".strip() or primary_email,
+                }
+            except Exception:
+                continue
+    return results
 
 
 # -----------------------------
@@ -267,9 +319,7 @@ def reels_for_upload(upload_id: str):
 
 
 # -----------------------------------------------------------------------
-# DELETE /api/uploads/bulk
-# Must be registered BEFORE /api/uploads/{upload_id} so FastAPI doesn't
-# match "bulk" as an upload_id path param.
+# DELETE /api/uploads/bulk  — must be before /{upload_id}
 # -----------------------------------------------------------------------
 @app.delete("/api/uploads/bulk")
 def bulk_delete_uploads(req: BulkDeleteRequest):
@@ -292,7 +342,6 @@ def bulk_delete_uploads(req: BulkDeleteRequest):
 
 
 def _delete_upload(upload_id: str):
-    """Core delete logic, callable internally and from the HTTP handler."""
     with engine.connect() as conn:
         upload = conn.execute(
             sa.text("SELECT s3_key, bucket FROM uploads WHERE id = :id"),
@@ -459,6 +508,7 @@ def compile_reel(req: CompileReelRequest):
 
     return {"status": "queued", "reel_id": reel_id}
 
+
 @app.delete("/api/reels/{reel_id}")
 def delete_reel(reel_id: str):
     with engine.connect() as conn:
@@ -481,6 +531,7 @@ def delete_reel(reel_id: str):
 
     return {"deleted": True, "reel_id": reel_id}
 
+
 @app.get("/api/reels/{reel_id}/download")
 def reel_download(reel_id: str):
     with engine.connect() as conn:
@@ -500,3 +551,106 @@ def reel_download(reel_id: str):
         ExpiresIn=900,
     )
     return {"download_url": url}
+
+
+# -----------------------------
+# Routes — admin
+# -----------------------------
+@app.get("/api/admin/stats")
+async def admin_stats(
+    x_admin_secret: str = Header(default=None),
+    x_clerk_user_id: str = Header(default=None),
+):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await _assert_clerk_admin(x_clerk_user_id)
+
+    with engine.connect() as conn:
+        dau = conn.execute(sa.text("""
+            SELECT COUNT(DISTINCT user_id) AS n FROM uploads
+            WHERE created_at >= NOW() - INTERVAL '1 day'
+        """)).mappings().first()
+
+        uploads_today = conn.execute(sa.text("""
+            SELECT COUNT(*) AS n FROM uploads
+            WHERE created_at >= NOW() - INTERVAL '1 day'
+        """)).mappings().first()
+
+        clips_today = conn.execute(sa.text("""
+            SELECT COUNT(*) AS n FROM clips
+            WHERE created_at >= NOW() - INTERVAL '1 day'
+        """)).mappings().first()
+
+        reels_today = conn.execute(sa.text("""
+            SELECT COUNT(*) AS n FROM reels
+            WHERE created_at >= NOW() - INTERVAL '1 day'
+        """)).mappings().first()
+
+        hit_stats = conn.execute(sa.text("""
+            SELECT
+                COUNT(*) FILTER (WHERE is_hit = true)  AS hits,
+                COUNT(*) AS total
+            FROM clips WHERE is_hit IS NOT NULL
+        """)).mappings().first()
+
+        totals = conn.execute(sa.text("""
+            SELECT
+                (SELECT COUNT(*) FROM uploads) AS total_uploads,
+                (SELECT COUNT(*) FROM clips)   AS total_clips,
+                (SELECT COUNT(*) FROM reels)   AS total_reels,
+                (SELECT COUNT(DISTINCT user_id) FROM uploads) AS total_users
+        """)).mappings().first()
+
+    hit_rate = (
+        round(hit_stats["hits"] / hit_stats["total"] * 100, 1)
+        if hit_stats["total"] else 0
+    )
+
+    return {
+        "dau":            int(dau["n"]),
+        "uploads_today":  int(uploads_today["n"]),
+        "clips_today":    int(clips_today["n"]),
+        "reels_today":    int(reels_today["n"]),
+        "hit_rate_pct":   hit_rate,
+        "total_uploads":  int(totals["total_uploads"]),
+        "total_clips":    int(totals["total_clips"]),
+        "total_reels":    int(totals["total_reels"]),
+        "total_users":    int(totals["total_users"]),
+    }
+
+
+@app.get("/api/admin/users")
+async def admin_users(
+    x_admin_secret: str = Header(default=None),
+    x_clerk_user_id: str = Header(default=None),
+):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await _assert_clerk_admin(x_clerk_user_id)
+
+    with engine.connect() as conn:
+        rows = conn.execute(sa.text("""
+            SELECT
+                user_id,
+                COUNT(*)       AS upload_count,
+                MAX(created_at) AS last_upload_at
+            FROM uploads
+            GROUP BY user_id
+            ORDER BY last_upload_at DESC
+        """)).mappings().all()
+
+    db_users = {r["user_id"]: dict(r) for r in rows}
+    clerk_users = await _fetch_clerk_users(list(db_users.keys()))
+
+    result = []
+    for user_id, db in db_users.items():
+        clerk = clerk_users.get(user_id, {})
+        result.append({
+            "user_id":        user_id,
+            "email":          clerk.get("email", ""),
+            "name":           clerk.get("name", ""),
+            "upload_count":   int(db.get("upload_count", 0)),
+            "last_upload_at": str(db.get("last_upload_at", "")),
+        })
+
+    return {"users": result}
