@@ -99,6 +99,7 @@ class UpdateClipRequest(BaseModel):
 class CompileReelRequest(BaseModel):
     upload_id: str
     clip_ids: List[str]
+    watermark: bool = True   # default on, user can opt out
 
 class BulkDeleteRequest(BaseModel):
     upload_ids: List[str]

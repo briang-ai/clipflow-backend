@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Load env ---
 load_dotenv()
-print("WORKER VERSION: quality_v2", flush=True)
+print("WORKER VERSION: watermark_v1", flush=True)
 
 
 def env_required(name: str) -> str:
@@ -43,7 +43,7 @@ AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.70"))
 # --- Tuning ---
 CLIP_SECONDS = float(os.getenv("CLIP_SECONDS", "8"))
 MAX_SEGMENTS = int(os.getenv("MAX_SEGMENTS", "30"))
-SCALE_HEIGHT = int(os.getenv("SCALE_HEIGHT", "1080"))   # was 720
+SCALE_HEIGHT = int(os.getenv("SCALE_HEIGHT", "1080"))
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "1")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "clipflow:jobs")
 
@@ -211,10 +211,10 @@ def run_ffmpeg_extract(source_path: str, out_path: str, start_sec: float, durati
         "-i", source_path,
         "-t", str(duration_sec),
         "-vf", f"scale=-2:{SCALE_HEIGHT}",
-        "-preset", "fast",      # was "veryfast" — better quality/compression trade-off
-        "-crf", "23",           # was 28 — visibly better quality (~2x file size)
+        "-preset", "fast",
+        "-crf", "23",
         "-c:a", "aac",
-        "-b:a", "128k",         # was 96k — cleaner audio for bat-crack detection
+        "-b:a", "128k",
         out_path,
     ]
     print("FFMPEG CMD:", " ".join(cmd), flush=True)
@@ -518,17 +518,19 @@ def process_compile_reel(job: dict):
         "player_name": "Jane",
         "jersey_number": "7",
         "game_date": "2026-03-07",
-        "clip_ids": ["uuid1", "uuid2", ...]
+        "clip_ids": ["uuid1", "uuid2", ...],
+        "watermark": true   // optional, default true
     }
     """
-    reel_id = job["reel_id"]
-    user_id = job["user_id"]
-    player_name = job.get("player_name", "unknown")
+    reel_id      = job["reel_id"]
+    user_id      = job["user_id"]
+    player_name  = job.get("player_name", "unknown")
     jersey_number = job.get("jersey_number", "")
-    game_date = job.get("game_date", "unknown_date")
-    clip_ids = job.get("clip_ids", [])
+    game_date    = job.get("game_date", "unknown_date")
+    clip_ids     = job.get("clip_ids", [])
+    watermark    = job.get("watermark", True)  # default on
 
-    print(f"compile_reel reel_id={reel_id} player={player_name} clips={len(clip_ids)}", flush=True)
+    print(f"compile_reel reel_id={reel_id} player={player_name} clips={len(clip_ids)} watermark={watermark}", flush=True)
 
     if not clip_ids:
         print("No clip_ids provided — aborting reel compilation.", flush=True)
@@ -546,6 +548,7 @@ def process_compile_reel(job: dict):
     print(f"Found {len(clips)} clips to stitch.", flush=True)
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Download each clip from S3
         local_paths = []
         for i, clip in enumerate(clips):
             local_path = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
@@ -553,6 +556,7 @@ def process_compile_reel(job: dict):
             s3.download_file(clip["bucket"], clip["s3_key"], local_path)
             local_paths.append(local_path)
 
+        # Write ffmpeg concat list
         concat_list_path = os.path.join(tmpdir, "concat.txt")
         with open(concat_list_path, "w") as f:
             for p in local_paths:
@@ -563,14 +567,43 @@ def process_compile_reel(job: dict):
         output_filename = f"highlights_{safe_name}_{game_date}.mp4"
         output_path = os.path.join(tmpdir, output_filename)
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_list_path,
-            "-c", "copy",
-            output_path,
-        ]
+        if watermark:
+            # Re-encode with drawtext watermark — bottom right corner
+            # Semi-transparent white text with a subtle dark shadow for legibility
+            drawtext = (
+                "drawtext="
+                "text='clipflow.pro':"
+                "fontsize=28:"
+                "fontcolor=white@0.6:"
+                "shadowcolor=black@0.5:"
+                "shadowx=1:shadowy=1:"
+                "x=w-tw-20:"   # 20px from right edge
+                "y=h-th-20"    # 20px from bottom edge
+            )
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list_path,
+                "-vf", drawtext,
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                output_path,
+            ]
+        else:
+            # No watermark — fast copy, no re-encode
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list_path,
+                "-c", "copy",
+                output_path,
+            ]
+
         print("FFMPEG CONCAT CMD:", " ".join(cmd), flush=True)
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.stderr:
@@ -578,6 +611,7 @@ def process_compile_reel(job: dict):
         if p.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed with code {p.returncode}")
 
+        # Upload finished reel to S3
         reel_s3_key = f"reels/{user_id}/{reel_id}/{output_filename}"
         print(f"Uploading reel to s3://{S3_CLIPS_BUCKET}/{reel_s3_key}", flush=True)
         s3.upload_file(
