@@ -573,12 +573,12 @@ def process_compile_reel(job: dict):
         logo_available = watermark and os.path.exists(LOGO_PATH)
 
         if logo_available:
-            # Re-encode with logo overlay — bottom right, 60px wide, 60% opacity
-            # [1:v] = logo input, scale to 120px wide keeping aspect ratio,
+            # Re-encode with logo overlay — bottom right, 90px wide, 80% opacity
+            # [1:v] = logo input, scale to 90px wide keeping aspect ratio,
             # convert to rgba, apply opacity, then overlay bottom-right with 20px margin
             filter_complex = (
-                "[1:v]scale=120:-1,format=rgba,"
-                "colorchannelmixer=aa=0.6[wm];"
+                "[1:v]scale=90:-1,format=rgba,"
+                "colorchannelmixer=aa=0.8[wm];"
                 "[0:v][wm]overlay=W-w-20:H-h-20[out]"
             )
             cmd = [
