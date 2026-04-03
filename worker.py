@@ -574,10 +574,10 @@ def process_compile_reel(job: dict):
 
         if logo_available:
             # Re-encode with logo overlay — bottom right, 60px wide, 60% opacity
-            # [1:v] = logo input, scale to 60px wide keeping aspect ratio,
+            # [1:v] = logo input, scale to 120px wide keeping aspect ratio,
             # convert to rgba, apply opacity, then overlay bottom-right with 20px margin
             filter_complex = (
-                "[1:v]scale=60:-1,format=rgba,"
+                "[1:v]scale=120:-1,format=rgba,"
                 "colorchannelmixer=aa=0.6[wm];"
                 "[0:v][wm]overlay=W-w-20:H-h-20[out]"
             )
