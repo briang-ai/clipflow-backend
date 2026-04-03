@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Load env ---
 load_dotenv()
-print("WORKER VERSION: watermark_v1", flush=True)
+print("WORKER VERSION: logo_watermark_v1", flush=True)
 
 
 def env_required(name: str) -> str:
@@ -46,6 +46,9 @@ MAX_SEGMENTS = int(os.getenv("MAX_SEGMENTS", "30"))
 SCALE_HEIGHT = int(os.getenv("SCALE_HEIGHT", "1080"))
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "1")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "clipflow:jobs")
+
+# Logo watermark — sits next to worker.py at the repo root
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "app", "logo.png")
 
 
 # --- Clients ---
@@ -519,16 +522,16 @@ def process_compile_reel(job: dict):
         "jersey_number": "7",
         "game_date": "2026-03-07",
         "clip_ids": ["uuid1", "uuid2", ...],
-        "watermark": true   // optional, default true
+        "watermark": true
     }
     """
-    reel_id      = job["reel_id"]
-    user_id      = job["user_id"]
-    player_name  = job.get("player_name", "unknown")
+    reel_id       = job["reel_id"]
+    user_id       = job["user_id"]
+    player_name   = job.get("player_name", "unknown")
     jersey_number = job.get("jersey_number", "")
-    game_date    = job.get("game_date", "unknown_date")
-    clip_ids     = job.get("clip_ids", [])
-    watermark    = job.get("watermark", True)  # default on
+    game_date     = job.get("game_date", "unknown_date")
+    clip_ids      = job.get("clip_ids", [])
+    watermark     = job.get("watermark", True)
 
     print(f"compile_reel reel_id={reel_id} player={player_name} clips={len(clip_ids)} watermark={watermark}", flush=True)
 
@@ -567,9 +570,35 @@ def process_compile_reel(job: dict):
         output_filename = f"highlights_{safe_name}_{game_date}.mp4"
         output_path = os.path.join(tmpdir, output_filename)
 
-        if watermark:
-            # Re-encode with drawtext watermark — bottom right corner
-            # Semi-transparent white text with a subtle dark shadow for legibility
+        logo_available = watermark and os.path.exists(LOGO_PATH)
+
+        if logo_available:
+            # Re-encode with logo overlay — bottom right, 60px wide, 60% opacity
+            # [1:v] = logo input, scale to 60px wide keeping aspect ratio,
+            # convert to rgba, apply opacity, then overlay bottom-right with 20px margin
+            filter_complex = (
+                "[1:v]scale=60:-1,format=rgba,"
+                "colorchannelmixer=aa=0.6[wm];"
+                "[0:v][wm]overlay=W-w-20:H-h-20[out]"
+            )
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list_path,
+                "-i", LOGO_PATH,
+                "-filter_complex", filter_complex,
+                "-map", "[out]",
+                "-map", "0:a?",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                output_path,
+            ]
+            print(f"Using logo watermark from: {LOGO_PATH}", flush=True)
+        elif watermark and not os.path.exists(LOGO_PATH):
+            # Logo file missing — fall back to text watermark so reel still gets branded
+            print(f"WARNING: logo.png not found at {LOGO_PATH}, falling back to text watermark", flush=True)
             drawtext = (
                 "drawtext="
                 "text='clipflow.pro':"
@@ -577,14 +606,11 @@ def process_compile_reel(job: dict):
                 "fontcolor=white@0.6:"
                 "shadowcolor=black@0.5:"
                 "shadowx=1:shadowy=1:"
-                "x=w-tw-20:"   # 20px from right edge
-                "y=h-th-20"    # 20px from bottom edge
+                "x=w-tw-20:y=h-th-20"
             )
             cmd = [
                 "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_list_path,
+                "-f", "concat", "-safe", "0", "-i", concat_list_path,
                 "-vf", drawtext,
                 "-c:v", "libx264",
                 "-preset", "fast",
@@ -594,12 +620,10 @@ def process_compile_reel(job: dict):
                 output_path,
             ]
         else:
-            # No watermark — fast copy, no re-encode
+            # No watermark — fast copy
             cmd = [
                 "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_list_path,
+                "-f", "concat", "-safe", "0", "-i", concat_list_path,
                 "-c", "copy",
                 output_path,
             ]
@@ -647,6 +671,8 @@ def main():
         "CLIP_SECONDS=", CLIP_SECONDS,
         "MAX_SEGMENTS=", MAX_SEGMENTS,
         "SCALE_HEIGHT=", SCALE_HEIGHT,
+        "LOGO_PATH=", LOGO_PATH,
+        "LOGO_EXISTS=", os.path.exists(LOGO_PATH),
         flush=True,
     )
 
