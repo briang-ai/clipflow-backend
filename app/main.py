@@ -65,6 +65,7 @@ S3_CLIPS_BUCKET   = env_required("S3_CLIPS_BUCKET")
 
 CLERK_SECRET_KEY = env_required("CLERK_SECRET_KEY")
 ADMIN_SECRET     = env_required("ADMIN_SECRET")
+ANTHROPIC_API_KEY = env_required("ANTHROPIC_API_KEY")
 
 
 # -----------------------------
@@ -99,7 +100,7 @@ class UpdateClipRequest(BaseModel):
 class CompileReelRequest(BaseModel):
     upload_id: str
     clip_ids: List[str]
-    watermark: bool = True   # default on, user can opt out
+    watermark: bool = True
 
 class BulkDeleteRequest(BaseModel):
     upload_ids: List[str]
@@ -109,7 +110,6 @@ class BulkDeleteRequest(BaseModel):
 # Admin helpers
 # -----------------------------
 async def _assert_clerk_admin(user_id: str | None):
-    """Verify the given Clerk user_id has role=admin in privateMetadata."""
     if not user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
     async with httpx.AsyncClient() as client:
@@ -125,7 +125,6 @@ async def _assert_clerk_admin(user_id: str | None):
 
 
 async def _fetch_clerk_users(user_ids: list[str]) -> dict[str, dict]:
-    """Fetch name + primary email for a list of Clerk user IDs."""
     results = {}
     async with httpx.AsyncClient() as client:
         for uid in user_ids:
@@ -504,6 +503,7 @@ def compile_reel(req: CompileReelRequest):
         "jersey_number": jersey_number or "",
         "game_date":     game_date.isoformat(),
         "clip_ids":      req.clip_ids,
+        "watermark":     req.watermark,
     })
     r.lpush("clipflow:jobs", job_payload)
 
@@ -620,7 +620,7 @@ async def admin_stats(
 
         hit_stats = conn.execute(sa.text("""
             SELECT
-                COUNT(*) FILTER (WHERE is_hit = true)  AS hits,
+                COUNT(*) FILTER (WHERE is_hit = true) AS hits,
                 COUNT(*) AS total
             FROM clips WHERE is_hit IS NOT NULL
         """)).mappings().first()
@@ -686,3 +686,42 @@ async def admin_users(
         })
 
     return {"users": result}
+
+
+@app.get("/api/admin/anthropic-balance")
+async def admin_anthropic_balance(
+    x_admin_secret: str = Header(default=None),
+    x_clerk_user_id: str = Header(default=None),
+):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await _assert_clerk_admin(x_clerk_user_id)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                "https://api.anthropic.com/v1/organizations/balance",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                timeout=10,
+            )
+        if res.status_code == 200:
+            data = res.json()
+            # Balance is returned in credits (cents), convert to dollars
+            balance_cents = data.get("balance", {}).get("total_cost", 0)
+            available = data.get("balance", {}).get("available", None)
+            return {
+                "ok": True,
+                "raw": data,
+                "available_usd": round(available / 100, 2) if available is not None else None,
+            }
+        else:
+            return {
+                "ok": False,
+                "status_code": res.status_code,
+                "error": res.text[:300],
+            }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
