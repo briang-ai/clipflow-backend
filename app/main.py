@@ -230,7 +230,8 @@ def debug_counts(upload_id: str):
 def clips_for_upload(upload_id: str):
     with engine.connect() as conn:
         rows = conn.execute(sa.text("""
-            SELECT id, upload_id, bucket, s3_key, start_sec, end_sec, label,
+            SELECT id, upload_id, bucket, s3_key, thumbnail_s3_key,
+                   start_sec, end_sec, label,
                    player_name, jersey_number, is_hit, is_swing,
                    ai_confidence, ai_reason, created_at
             FROM clips
@@ -256,7 +257,28 @@ def upload_summary(upload_id: str):
         "swing_count": int(row["swing_count"] or 0),
         "total_clips": int(row["total_clips"] or 0),
     }
+@app.get("/api/uploads/{upload_id}/thumbnail")
+def upload_thumbnail(upload_id: str):
+    """Returns a short-lived presigned URL for the first clip thumbnail of an upload."""
+    with engine.connect() as conn:
+        row = conn.execute(sa.text("""
+            SELECT thumbnail_s3_key
+            FROM clips
+            WHERE upload_id = :upload_id
+              AND thumbnail_s3_key IS NOT NULL
+            ORDER BY start_sec ASC
+            LIMIT 1
+        """), {"upload_id": upload_id}).mappings().first()
 
+    if not row or not row["thumbnail_s3_key"]:
+        raise HTTPException(status_code=404, detail="No thumbnail available")
+
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_CLIPS_BUCKET, "Key": row["thumbnail_s3_key"]},
+        ExpiresIn=3600,
+    )
+    return {"thumbnail_url": url}
 
 @app.get("/api/uploads/{upload_id}/reels")
 def reels_for_upload(upload_id: str):
