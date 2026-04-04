@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Load env ---
 load_dotenv()
-print("WORKER VERSION: logo_watermark_v1", flush=True)
+print("WORKER VERSION: swing_detection_v1", flush=True)
 
 
 def env_required(name: str) -> str:
@@ -47,7 +47,7 @@ SCALE_HEIGHT = int(os.getenv("SCALE_HEIGHT", "1080"))
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "1")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "clipflow:jobs")
 
-# Logo watermark — sits next to worker.py at the repo root
+# Logo watermark
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "app", "logo.png")
 
 
@@ -94,6 +94,7 @@ def db_insert_clip(
     end_sec: float,
     label: str,
     is_hit: bool | None,
+    is_swing: bool | None,
     ai_confidence: float | None,
     ai_reason: str | None,
 ):
@@ -104,11 +105,11 @@ def db_insert_clip(
                 """
                 INSERT INTO clips (
                     id, upload_id, bucket, s3_key, start_sec, end_sec, label,
-                    is_hit, ai_confidence, ai_reason
+                    is_hit, is_swing, ai_confidence, ai_reason
                 )
                 VALUES (
                     :id, :upload_id, :bucket, :s3_key, :start_sec, :end_sec, :label,
-                    :is_hit, :ai_confidence, :ai_reason
+                    :is_hit, :is_swing, :ai_confidence, :ai_reason
                 )
                 """
             ),
@@ -121,6 +122,7 @@ def db_insert_clip(
                 "end_sec": end_sec,
                 "label": label,
                 "is_hit": is_hit,
+                "is_swing": is_swing,
                 "ai_confidence": ai_confidence,
                 "ai_reason": ai_reason,
             },
@@ -325,10 +327,12 @@ def get_audio_features(video_path: str) -> str:
         return summary
 
 
-def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, str | None]:
+def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, bool | None, float | None, str | None]:
     """
-    Returns (is_hit, confidence, reason).
-    Uses 10 evenly-spaced frames + audio transient analysis.
+    Returns (is_hit, is_swing, confidence, reason).
+    is_hit=True  → confirmed contact, ball leaves bat
+    is_swing=True → any full swing attempt, hit or miss
+    is_swing=False → no swing (dead time, fielding, waiting)
     """
     with tempfile.TemporaryDirectory() as tdir:
         clip_duration = run_ffprobe_duration_seconds(clip_path)
@@ -344,34 +348,38 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
 
         system_prompt = (
             "You are an expert baseball video analyst specializing in youth Little League games. "
-            "Your job is to detect batting highlight moments for a player highlight reel.\n\n"
+            "Your job is to classify batting moments for a player highlight reel.\n\n"
 
-            "STRONG indicators a clip IS a hit (is_hit=true):\n"
-            "- Batter completes a swing with visible bat-ball contact or ball leaving the bat\n"
-            "- Ball in flight off the bat (line drive, fly ball, ground ball off bat)\n"
-            "- Batter immediately drops bat and starts running toward first base\n"
-            "- Sharp crack or impact sound at the moment of swing\n"
-            "- Fielders reacting to a live ball — tracking a fly, charging a grounder\n"
-            "- Batter running the bases (already past contact moment)\n\n"
+            "You must return TWO boolean values:\n\n"
 
-            "STRONG indicators a clip is NOT a hit (is_hit=false):\n"
-            "- Batter standing still waiting for a pitch with no swing initiated\n"
-            "- Swing and miss — bat completes full arc, ball reaches catcher glove\n"
-            "- Pitcher in wind-up with no batter swing visible\n"
-            "- Dead time between pitches — batter stepping out, coach visit, timeout\n"
-            "- Pure fielding play with no batter involvement\n"
-            "- Batter remains in box holding bat after pitch (called strike or ball)\n\n"
+            "1. is_hit — true ONLY if the batter makes confirmed contact and the ball leaves the bat:\n"
+            "   TRUE indicators:\n"
+            "   - Bat-ball contact visible, ball leaving the bat\n"
+            "   - Ball in flight off the bat (line drive, fly ball, grounder off bat)\n"
+            "   - Batter drops bat and immediately runs to first base\n"
+            "   - Sharp audio crack at swing moment\n"
+            "   - Fielders reacting to a live ball\n"
+            "   - Batter already running the bases\n\n"
+            "   FALSE indicators:\n"
+            "   - Swing and miss (bat completes arc, ball reaches catcher)\n"
+            "   - Batter standing still, no swing\n"
+            "   - Dead time, coach visit, timeout\n"
+            "   - Pure fielding play\n\n"
 
-            "Key signals ranked by importance:\n"
-            "1. BAT DROP + IMMEDIATE RUN = almost certain hit. Strongest single signal.\n"
-            "2. BALL VISIBLE IN FLIGHT off bat = confirmed contact.\n"
-            "3. SHARP AUDIO TRANSIENT at swing moment = bat-crack indicator.\n"
-            "4. FOLLOW-THROUGH swing posture vs checked/incomplete swing.\n"
-            "5. FIELDER REACTION to a live ball.\n\n"
+            "2. is_swing — true if the batter attempts ANY full swing, hit OR miss:\n"
+            "   TRUE indicators:\n"
+            "   - Full swing arc visible, regardless of contact\n"
+            "   - Swing and miss counts as is_swing=true, is_hit=false\n"
+            "   - A hit also counts as is_swing=true, is_hit=true\n\n"
+            "   FALSE indicators:\n"
+            "   - Batter standing still waiting for pitch (no swing initiated)\n"
+            "   - Checked swing where bat barely moves\n"
+            "   - Dead time between pitches\n"
+            "   - Fielding plays with no batter\n\n"
 
-            "IMPORTANT: A batter standing at the plate ready to hit is NOT a hit — "
-            "you must see the swing AND evidence of contact or its result. "
-            "Being at the plate in an active at-bat alone is NOT sufficient for is_hit=true. "
+            "Key rule: if is_hit=true then is_swing must also be true.\n\n"
+
+            "IMPORTANT: A batter standing at the plate ready to hit is NOT a swing. "
             "Return strict JSON only."
         )
 
@@ -379,12 +387,12 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
             f"Here are 10 sequential frames from a {clip_duration:.1f}-second youth baseball clip, "
             "evenly spaced from start to end. Treat them as a flip-book — analyze motion "
             "across the sequence.\n\n"
-            "Look for: swing initiation → contact moment → follow-through → bat drop → running. "
-            "A batter simply standing at the plate ready to swing is NOT a hit.\n\n"
+            "Classify: did the batter swing? Did they make contact?\n\n"
             f"Audio analysis: {audio_summary}\n\n"
             "Return ONLY this JSON:\n"
             "{\n"
             "  \"is_hit\": true or false,\n"
+            "  \"is_swing\": true or false,\n"
             "  \"confidence\": 0.0 to 1.0,\n"
             "  \"reason\": \"1-2 sentences citing specific visual evidence across frames\"\n"
             "}"
@@ -408,12 +416,16 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, float | None, st
         try:
             raw = raw.replace("```json", "").replace("```", "").strip()
             data = json.loads(raw)
-            is_hit = bool(data.get("is_hit"))
+            is_hit   = bool(data.get("is_hit"))
+            is_swing = bool(data.get("is_swing"))
+            # Enforce rule: hit implies swing
+            if is_hit:
+                is_swing = True
             confidence = float(data.get("confidence", 0.0))
             reason = str(data.get("reason", ""))[:500]
-            return is_hit, confidence, reason
+            return is_hit, is_swing, confidence, reason
         except Exception:
-            return None, None, f"Unparseable AI response: {raw[:500]}"
+            return None, None, None, f"Unparseable AI response: {raw[:500]}"
 
 
 # ---------------------------------------------------------------
@@ -465,14 +477,16 @@ def process_upload(upload_id: str):
 
             try:
                 print(f"ABOUT TO CALL AI FOR {label}", flush=True)
-                is_hit, ai_confidence, ai_reason = classify_clip_with_ai(clip_path)
+                is_hit, is_swing, ai_confidence, ai_reason = classify_clip_with_ai(clip_path)
                 print(
-                    f"AI RESULT {label}: is_hit={is_hit} confidence={ai_confidence} reason={ai_reason}",
+                    f"AI RESULT {label}: is_hit={is_hit} is_swing={is_swing} "
+                    f"confidence={ai_confidence} reason={ai_reason}",
                     flush=True,
                 )
             except Exception as e:
                 print(f"AI FAILED FOR {label}: {e}", flush=True)
                 is_hit = None
+                is_swing = None
                 ai_confidence = None
                 ai_reason = f"AI failed: {e}"
 
@@ -493,6 +507,7 @@ def process_upload(upload_id: str):
                 end_sec=end_sec,
                 label=label,
                 is_hit=is_hit,
+                is_swing=is_swing,
                 ai_confidence=ai_confidence,
                 ai_reason=ai_reason,
             )
@@ -511,7 +526,7 @@ def process_upload(upload_id: str):
 
 def process_compile_reel(job: dict):
     """
-    Compile a highlight reel from a list of hit clip IDs.
+    Compile a highlight reel from a list of clip IDs.
 
     Job payload (JSON):
     {
@@ -551,7 +566,6 @@ def process_compile_reel(job: dict):
     print(f"Found {len(clips)} clips to stitch.", flush=True)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Download each clip from S3
         local_paths = []
         for i, clip in enumerate(clips):
             local_path = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
@@ -559,7 +573,6 @@ def process_compile_reel(job: dict):
             s3.download_file(clip["bucket"], clip["s3_key"], local_path)
             local_paths.append(local_path)
 
-        # Write ffmpeg concat list
         concat_list_path = os.path.join(tmpdir, "concat.txt")
         with open(concat_list_path, "w") as f:
             for p in local_paths:
@@ -573,11 +586,8 @@ def process_compile_reel(job: dict):
         logo_available = watermark and os.path.exists(LOGO_PATH)
 
         if logo_available:
-            # Re-encode with logo overlay — bottom right, 90px wide, 80% opacity
-            # [1:v] = logo input, scale to 90px wide keeping aspect ratio,
-            # convert to rgba, apply opacity, then overlay bottom-right with 20px margin
             filter_complex = (
-                "[1:v]scale=90:-1,format=rgba,"
+                "[1:v]scale=120:-1,format=rgba,"
                 "colorchannelmixer=aa=0.8[wm];"
                 "[0:v][wm]overlay=W-w-20:H-h-20[out]"
             )
@@ -597,7 +607,6 @@ def process_compile_reel(job: dict):
             ]
             print(f"Using logo watermark from: {LOGO_PATH}", flush=True)
         elif watermark and not os.path.exists(LOGO_PATH):
-            # Logo file missing — fall back to text watermark so reel still gets branded
             print(f"WARNING: logo.png not found at {LOGO_PATH}, falling back to text watermark", flush=True)
             drawtext = (
                 "drawtext="
@@ -620,7 +629,6 @@ def process_compile_reel(job: dict):
                 output_path,
             ]
         else:
-            # No watermark — fast copy
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0", "-i", concat_list_path,
@@ -635,7 +643,6 @@ def process_compile_reel(job: dict):
         if p.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed with code {p.returncode}")
 
-        # Upload finished reel to S3
         reel_s3_key = f"reels/{user_id}/{reel_id}/{output_filename}"
         print(f"Uploading reel to s3://{S3_CLIPS_BUCKET}/{reel_s3_key}", flush=True)
         s3.upload_file(
