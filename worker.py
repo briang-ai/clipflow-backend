@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Load env ---
 load_dotenv()
-print("WORKER VERSION: thumbnails_v3", flush=True)
+print("WORKER VERSION: thumbnails_v4", flush=True)
 
 
 def env_required(name: str) -> str:
@@ -510,31 +510,67 @@ def process_compile_reel(job: dict):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_paths = []
+
         for i, clip in enumerate(clips):
-            raw_path = os.path.join(tmpdir, f"clip_{i:03d}_raw.mp4")
+            raw_path  = os.path.join(tmpdir, f"clip_{i:03d}_raw.mp4")
             norm_path = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
             print(f"Downloading clip {clip['id']} from s3://{clip['bucket']}/{clip['s3_key']}", flush=True)
             s3.download_file(clip["bucket"], clip["s3_key"], raw_path)
 
-            # Normalize every clip to the same resolution, pixel format,
-            # timebase, and audio sample rate before concatenating.
-            # This eliminates mismatched stream properties that cause
-            # the overlay filter to drop, audio stutter, and DTS errors.
-            norm_cmd = [
-                "ffmpeg", "-y", "-i", raw_path,
-                "-vf", "scale=720:-2,setsar=1",
-                "-r", "30",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-                "-vsync", "cfr",
-                norm_path,
-            ]
-            np = subprocess.run(norm_cmd, capture_output=True, text=True)
-            if np.returncode != 0:
-                print(f"Normalize failed for clip {i}, using raw: {np.stderr[-300:]}", flush=True)
-                local_paths.append(raw_path)
+            # Normalize to 720px tall (portrait-first), 30fps CFR,
+            # 44100Hz stereo AAC — identical specs across every clip.
+            # If watermark is enabled, bake it into each clip individually
+            # here so the overlay never has to survive a stream change
+            # mid-concat. Concat then becomes a pure stream copy.
+            if logo_available:
+                vf = (
+                    "scale=-2:720,setsar=1,"
+                    f"movie={LOGO_PATH}[wm_raw];"
+                    "[wm_raw]scale=86:-1,format=rgba,colorchannelmixer=aa=0.8[wm];"
+                    "[in][wm]overlay=W-w-20:H-h-20[out]"
+                )
+                norm_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", raw_path,
+                    "-filter_complex", vf,
+                    "-map", "[out]", "-map", "0:a?",
+                    "-r", "30", "-vsync", "cfr",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                    norm_path,
+                ]
+            elif watermark:
+                drawtext = (
+                    "scale=-2:720,setsar=1,"
+                    "drawtext=text='clipflow.pro':fontsize=28:fontcolor=white@0.6:"
+                    "shadowcolor=black@0.5:shadowx=1:shadowy=1:x=w-tw-20:y=h-th-20"
+                )
+                norm_cmd = [
+                    "ffmpeg", "-y", "-i", raw_path,
+                    "-vf", drawtext,
+                    "-r", "30", "-vsync", "cfr",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                    norm_path,
+                ]
             else:
-                local_paths.append(norm_path)
+                norm_cmd = [
+                    "ffmpeg", "-y", "-i", raw_path,
+                    "-vf", "scale=-2:720,setsar=1",
+                    "-r", "30", "-vsync", "cfr",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                    norm_path,
+                ]
+
+            np = subprocess.run(norm_cmd, capture_output=True, text=True)
+            if np.stderr:
+                print(f"Normalize clip {i} STDERR:\n{np.stderr[-500:]}", flush=True)
+            if np.returncode != 0:
+                print(f"Normalize failed for clip {i} — aborting reel.", flush=True)
+                db_set_reel_status(reel_id, "error")
+                return
+            local_paths.append(norm_path)
 
         concat_list_path = os.path.join(tmpdir, "concat.txt")
         with open(concat_list_path, "w") as f:
@@ -548,7 +584,13 @@ def process_compile_reel(job: dict):
 
         logo_available = watermark and os.path.exists(LOGO_PATH)
 
-        if logo_available:
+        # Simple stream copy — all encoding and watermarking done per-clip above
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-c", "copy",
+            output_path,
+        ]
             print(f"Using logo watermark from: {LOGO_PATH}", flush=True)
             # Scale logo to 72px wide (visible on portrait 406px wide video,
             # unobtrusive on landscape). Simple explicit scale avoids
