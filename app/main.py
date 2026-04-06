@@ -366,6 +366,24 @@ def clip_download(clip_id: str):
     )
     return {"download_url": url}
 
+@app.get("/api/clips/{clip_id}/thumbnail")
+def clip_thumbnail(clip_id: str):
+    """Returns a short-lived presigned URL for a single clip's thumbnail."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT thumbnail_s3_key FROM clips WHERE id = :id"),
+            {"id": clip_id},
+        ).mappings().first()
+
+    if not row or not row["thumbnail_s3_key"]:
+        raise HTTPException(status_code=404, detail="No thumbnail available")
+
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_CLIPS_BUCKET, "Key": row["thumbnail_s3_key"]},
+        ExpiresIn=3600,
+    )
+    return {"thumbnail_url": url}
 
 @app.patch("/api/clips/{clip_id}")
 def update_clip(clip_id: str, req: UpdateClipRequest):
