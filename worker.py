@@ -508,6 +508,12 @@ def process_compile_reel(job: dict):
 
     print(f"Found {len(clips)} clips to stitch.", flush=True)
 
+    logo_available = watermark and os.path.exists(LOGO_PATH)
+    if logo_available:
+        print(f"Using logo watermark from: {LOGO_PATH}", flush=True)
+    elif watermark:
+        print(f"WARNING: logo.png not found at {LOGO_PATH}, falling back to text watermark", flush=True)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         local_paths = []
 
@@ -517,22 +523,23 @@ def process_compile_reel(job: dict):
             print(f"Downloading clip {clip['id']} from s3://{clip['bucket']}/{clip['s3_key']}", flush=True)
             s3.download_file(clip["bucket"], clip["s3_key"], raw_path)
 
-            # Normalize to 720px tall (portrait-first), 30fps CFR,
-            # 44100Hz stereo AAC — identical specs across every clip.
-            # If watermark is enabled, bake it into each clip individually
-            # here so the overlay never has to survive a stream change
-            # mid-concat. Concat then becomes a pure stream copy.
+            # Normalize every clip to identical specs and bake in the
+            # watermark per-clip. This means the final concat is a pure
+            # stream copy with nothing that can break mid-video.
+            # scale=-2:720 → portrait-first 720px tall, width auto even.
+            # 30fps CFR, 44100Hz stereo AAC ensures uniform timebases.
+            # Logo scaled to 86px wide (~20% larger than previous 72px).
             if logo_available:
-                vf = (
-                    "scale=-2:720,setsar=1,"
-                    f"movie={LOGO_PATH}[wm_raw];"
-                    "[wm_raw]scale=86:-1,format=rgba,colorchannelmixer=aa=0.8[wm];"
-                    "[in][wm]overlay=W-w-20:H-h-20[out]"
+                filter_complex = (
+                    f"[1:v]scale=86:-1,format=rgba,colorchannelmixer=aa=0.8[wm];"
+                    f"[0:v]scale=-2:720,setsar=1[base];"
+                    f"[base][wm]overlay=W-w-20:H-h-20[out]"
                 )
                 norm_cmd = [
                     "ffmpeg", "-y",
                     "-i", raw_path,
-                    "-filter_complex", vf,
+                    "-i", LOGO_PATH,
+                    "-filter_complex", filter_complex,
                     "-map", "[out]", "-map", "0:a?",
                     "-r", "30", "-vsync", "cfr",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -540,14 +547,13 @@ def process_compile_reel(job: dict):
                     norm_path,
                 ]
             elif watermark:
-                drawtext = (
-                    "scale=-2:720,setsar=1,"
-                    "drawtext=text='clipflow.pro':fontsize=28:fontcolor=white@0.6:"
-                    "shadowcolor=black@0.5:shadowx=1:shadowy=1:x=w-tw-20:y=h-th-20"
-                )
                 norm_cmd = [
                     "ffmpeg", "-y", "-i", raw_path,
-                    "-vf", drawtext,
+                    "-vf", (
+                        "scale=-2:720,setsar=1,"
+                        "drawtext=text='clipflow.pro':fontsize=28:fontcolor=white@0.6:"
+                        "shadowcolor=black@0.5:shadowx=1:shadowy=1:x=w-tw-20:y=h-th-20"
+                    ),
                     "-r", "30", "-vsync", "cfr",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                     "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
@@ -582,57 +588,13 @@ def process_compile_reel(job: dict):
         output_filename = f"highlights_{safe_name}_{game_date}.mp4"
         output_path = os.path.join(tmpdir, output_filename)
 
-        logo_available = watermark and os.path.exists(LOGO_PATH)
-
-        # Simple stream copy — all encoding and watermarking done per-clip above
+        # Watermark already baked per-clip — final concat is a pure stream copy
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_list_path,
             "-c", "copy",
             output_path,
         ]
-            print(f"Using logo watermark from: {LOGO_PATH}", flush=True)
-            # Scale logo to 72px wide (visible on portrait 406px wide video,
-            # unobtrusive on landscape). Simple explicit scale avoids
-            # scale2ref ordering bugs. aresample=async=1 fixes non-monotonous
-            # DTS audio stuttering from concatenating clips recorded at
-            # different times.
-            filter_complex = (
-                "[1:v]scale=72:-1,format=rgba,colorchannelmixer=aa=0.8[wm];"
-                "[0:v][wm]overlay=W-w-20:H-h-20[out]"
-            )
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0", "-i", concat_list_path,
-                "-i", LOGO_PATH,
-                "-filter_complex", filter_complex,
-                "-map", "[out]", "-map", "0:a?",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path,
-            ]
-        elif watermark:
-            print(f"WARNING: logo.png not found at {LOGO_PATH}, falling back to text watermark", flush=True)
-            drawtext = (
-                "drawtext=text='clipflow.pro':fontsize=28:fontcolor=white@0.6:"
-                "shadowcolor=black@0.5:shadowx=1:shadowy=1:x=w-tw-20:y=h-th-20"
-            )
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0", "-i", concat_list_path,
-                "-vf", drawtext,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path,
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0", "-i", concat_list_path,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                output_path,
-            ]
 
         print("FFMPEG CONCAT CMD:", " ".join(cmd), flush=True)
         p = subprocess.run(cmd, capture_output=True, text=True)
