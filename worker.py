@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Load env ---
 load_dotenv()
-print("WORKER VERSION: thumbnails_v2", flush=True)
+print("WORKER VERSION: thumbnails_v3", flush=True)
 
 
 def env_required(name: str) -> str:
@@ -511,10 +511,30 @@ def process_compile_reel(job: dict):
     with tempfile.TemporaryDirectory() as tmpdir:
         local_paths = []
         for i, clip in enumerate(clips):
-            local_path = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
+            raw_path = os.path.join(tmpdir, f"clip_{i:03d}_raw.mp4")
+            norm_path = os.path.join(tmpdir, f"clip_{i:03d}.mp4")
             print(f"Downloading clip {clip['id']} from s3://{clip['bucket']}/{clip['s3_key']}", flush=True)
-            s3.download_file(clip["bucket"], clip["s3_key"], local_path)
-            local_paths.append(local_path)
+            s3.download_file(clip["bucket"], clip["s3_key"], raw_path)
+
+            # Normalize every clip to the same resolution, pixel format,
+            # timebase, and audio sample rate before concatenating.
+            # This eliminates mismatched stream properties that cause
+            # the overlay filter to drop, audio stutter, and DTS errors.
+            norm_cmd = [
+                "ffmpeg", "-y", "-i", raw_path,
+                "-vf", "scale=720:-2,setsar=1",
+                "-r", "30",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                "-vsync", "cfr",
+                norm_path,
+            ]
+            np = subprocess.run(norm_cmd, capture_output=True, text=True)
+            if np.returncode != 0:
+                print(f"Normalize failed for clip {i}, using raw: {np.stderr[-300:]}", flush=True)
+                local_paths.append(raw_path)
+            else:
+                local_paths.append(norm_path)
 
         concat_list_path = os.path.join(tmpdir, "concat.txt")
         with open(concat_list_path, "w") as f:
@@ -547,12 +567,10 @@ def process_compile_reel(job: dict):
                 "-map", "[out]", "-map", "0:a?",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k",
-                "-af", "aresample=async=1",
                 output_path,
             ]
         elif watermark:
             print(f"WARNING: logo.png not found at {LOGO_PATH}, falling back to text watermark", flush=True)
-            # aresample=async=1 also applied to text watermark fallback
             drawtext = (
                 "drawtext=text='clipflow.pro':fontsize=28:fontcolor=white@0.6:"
                 "shadowcolor=black@0.5:shadowx=1:shadowy=1:x=w-tw-20:y=h-th-20"
@@ -563,17 +581,14 @@ def process_compile_reel(job: dict):
                 "-vf", drawtext,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k",
-                "-af", "aresample=async=1",
                 output_path,
             ]
         else:
-            # No watermark — still fix audio, drop -c copy since we're re-encoding audio
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0", "-i", concat_list_path,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k",
-                "-af", "aresample=async=1",
                 output_path,
             ]
 
