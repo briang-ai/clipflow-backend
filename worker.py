@@ -530,15 +530,14 @@ def process_compile_reel(job: dict):
 
         if logo_available:
             print(f"Using logo watermark from: {LOGO_PATH}", flush=True)
-            # scale2ref scales the logo to 1/10th of the video's height,
-            # preserving aspect ratio — works correctly for any resolution
-            # or orientation (portrait 406x720, landscape 1920x1080, etc).
-            # aresample=async=1 fixes non-monotonous DTS audio stuttering
-            # caused by concatenating clips from different recordings.
+            # Scale logo to 72px wide (visible on portrait 406px wide video,
+            # unobtrusive on landscape). Simple explicit scale avoids
+            # scale2ref ordering bugs. aresample=async=1 fixes non-monotonous
+            # DTS audio stuttering from concatenating clips recorded at
+            # different times.
             filter_complex = (
-                "[0:v][1:v]scale2ref=oh*mdar/dar:ih/10[wm_scaled][vid];"
-                "[wm_scaled]format=rgba,colorchannelmixer=aa=0.8[wm];"
-                "[vid][wm]overlay=W-w-20:H-h-20[out]"
+                "[1:v]scale=72:-1,format=rgba,colorchannelmixer=aa=0.8[wm];"
+                "[0:v][wm]overlay=W-w-20:H-h-20[out]"
             )
             cmd = [
                 "ffmpeg", "-y",
