@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Load env ---
 load_dotenv()
-print("WORKER VERSION: thumbnails_v4", flush=True)
+print("WORKER VERSION: thumbnails_v5", flush=True)
 
 
 def env_required(name: str) -> str:
@@ -38,7 +38,7 @@ S3_CLIPS_BUCKET = env_required("S3_CLIPS_BUCKET")
 
 ANTHROPIC_API_KEY = env_required("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.70"))
+AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.82"))
 
 # --- Tuning ---
 CLIP_SECONDS = float(os.getenv("CLIP_SECONDS", "8"))
@@ -320,25 +320,49 @@ def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, bool | None, flo
         frame_paths = extract_frames_for_ai(clip_path, tdir, clip_duration, count=10)
 
         system_prompt = (
-            "You are an expert baseball video analyst specializing in youth Little League games. "
-            "Your job is to classify batting moments for a player highlight reel.\n\n"
+            "You are an expert youth baseball video analyst. Your job is to classify "
+            "8-second clips from Little League games for a player highlight reel. "
+            "You must be CONSERVATIVE — it is far better to miss a real hit than to "
+            "include a false positive.\n\n"
+
             "You must return TWO boolean values:\n\n"
-            "1. is_hit — true ONLY if the batter makes confirmed contact and the ball leaves the bat:\n"
-            "   TRUE: bat-ball contact visible, ball in flight, batter drops bat and runs, "
-            "sharp audio crack, fielders reacting, batter already on bases.\n"
-            "   FALSE: swing and miss, batter standing still, dead time, fielding only.\n\n"
-            "2. is_swing — true if the batter attempts ANY full swing, hit OR miss:\n"
-            "   TRUE: full swing arc visible regardless of contact. Swing and miss = is_swing true, is_hit false.\n"
-            "   FALSE: no swing initiated, checked swing, dead time, fielding plays.\n\n"
-            "Rule: if is_hit=true then is_swing must also be true.\n"
-            "Return strict JSON only."
+
+            "1. is_hit — true ONLY when ALL of the following are visible:\n"
+            "   - A live pitch is delivered (ball thrown by pitcher toward batter)\n"
+            "   - The batter makes a FULL swing at that live pitch\n"
+            "   - Bat-ball contact is confirmed (ball changes direction, ball in flight "
+            "away from home plate, batter drops bat to run, fielders react)\n"
+            "   FALSE for: swing and miss, foul tip with no clear contact, batter "
+            "standing still, practice/warmup swings before pitch, ball hitting "
+            "catcher's mitt, dead time between pitches, fielding plays, baserunning.\n\n"
+
+            "2. is_swing — true ONLY when a batter makes a FULL swing arc at a LIVE "
+            "pitch (pitcher has released the ball toward home plate).\n"
+            "   FALSE for: practice swings before the pitch, warmup swings in the "
+            "on-deck circle, checked swings that stop before the hitting zone, "
+            "batter adjusting stance, no pitch in progress.\n\n"
+
+            "Key false positive patterns to REJECT:\n"
+            "   - Sharp audio crack from ball hitting catcher's mitt (no bat movement)\n"
+            "   - Batter taking practice swings while waiting for pitch\n"
+            "   - Loud crowd noise or equipment noise with no swing visible\n"
+            "   - Batter fouling off a pitch but ball stays near home plate\n"
+            "   - Clip shows only fielding, running, or between-pitch dead time\n"
+            "   - Batter swings but clip cuts before contact is visible\n\n"
+
+            "Rule: is_hit=true requires is_swing=true. "
+            "If you are not confident, set both to false and confidence below 0.5.\n"
+            "Return strict JSON only — no explanation outside the JSON."
         )
 
         user_text = (
-            f"Here are 10 sequential frames from a {clip_duration:.1f}-second youth baseball clip. "
-            "Treat them as a flip-book.\n\n"
-            "Classify: did the batter swing? Did they make contact?\n\n"
-            f"Audio analysis: {audio_summary}\n\n"
+            f"Here are 10 sequential frames from a {clip_duration:.1f}-second "
+            "youth baseball clip. Treat them as a flip-book in chronological order.\n\n"
+            "Audio analysis: " + audio_summary + "\n\n"
+            "IMPORTANT: Audio alone is NOT sufficient to classify a hit. A sharp "
+            "audio crack is equally likely to be a ball hitting the catcher's mitt. "
+            "You MUST see visible bat-ball contact or ball flight in the frames to "
+            "set is_hit=true.\n\n"
             "Return ONLY this JSON:\n"
             "{\n"
             "  \"is_hit\": true or false,\n"
