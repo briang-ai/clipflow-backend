@@ -5,10 +5,11 @@ from typing import List, Literal, Optional
 
 import boto3
 import httpx
+import jwt
 import redis
 import sqlalchemy as sa
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -51,7 +52,6 @@ AWS_SECRET_ACCESS_KEY = env_required("AWS_SECRET_ACCESS_KEY")
 S3_UPLOADS_BUCKET = env_required("S3_UPLOADS_BUCKET")
 S3_CLIPS_BUCKET   = env_required("S3_CLIPS_BUCKET")
 CLERK_SECRET_KEY  = env_required("CLERK_SECRET_KEY")
-ADMIN_SECRET      = env_required("ADMIN_SECRET")
 ANTHROPIC_API_KEY = env_required("ANTHROPIC_API_KEY")
 
 engine = sa.create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -66,10 +66,105 @@ s3 = boto3.client(
 
 
 # -----------------------------
+# Auth — verify the signed-in Clerk user on every request
+# -----------------------------
+# The browser sends "Authorization: Bearer <Clerk session token>".
+# We check the token's signature against Clerk's public keys, so the
+# user ID we get back can't be faked by editing a request.
+CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "https://api.clerk.com/v1/jwks")
+_jwks_client = jwt.PyJWKClient(
+    CLERK_JWKS_URL,
+    headers={"Authorization": f"Bearer {CLERK_SECRET_KEY}"},
+    cache_keys=True,
+    lifespan=3600,
+    timeout=10,
+)
+
+
+def verify_clerk_token(token: str) -> str:
+    """Return the Clerk user ID for a valid session token, else raise 401."""
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={"require": ["exp", "sub"], "verify_aud": False},
+            leeway=5,
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Not signed in")
+    # Clerk puts the page's origin in "azp"; only accept tokens minted for our site.
+    azp = claims.get("azp")
+    if azp and azp not in ALLOWED_ORIGINS:
+        raise HTTPException(status_code=401, detail="Not signed in")
+    user_id = claims.get("sub")
+    if not isinstance(user_id, str) or not user_id:
+        raise HTTPException(status_code=401, detail="Not signed in")
+    return user_id
+
+
+def current_user(authorization: str | None = Header(default=None)) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not signed in")
+    return verify_clerk_token(authorization.split(" ", 1)[1].strip())
+
+
+def _valid_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def _require_upload_owner(upload_id: str, user_id: str) -> dict:
+    """404 unless the upload exists and belongs to this user."""
+    if not _valid_uuid(upload_id):
+        raise HTTPException(status_code=404, detail="Upload not found")
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT id, user_id, s3_key, bucket, status FROM uploads WHERE id = :id"),
+            {"id": upload_id}).mappings().first()
+    if not row or row["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    return dict(row)
+
+
+def _require_clip_owner(clip_id: str, user_id: str) -> dict:
+    """404 unless the clip exists and its upload belongs to this user."""
+    if not _valid_uuid(clip_id):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    with engine.connect() as conn:
+        row = conn.execute(sa.text("""
+            SELECT c.id, c.bucket, c.s3_key, c.thumbnail_s3_key, u.user_id
+            FROM clips c JOIN uploads u ON u.id = c.upload_id
+            WHERE c.id = :id
+        """), {"id": clip_id}).mappings().first()
+    if not row or row["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return dict(row)
+
+
+def _require_reel_owner(reel_id: str, user_id: str) -> dict:
+    if not _valid_uuid(reel_id):
+        raise HTTPException(status_code=404, detail="Reel not found")
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT id, user_id, status, s3_key FROM reels WHERE id = :id"),
+            {"id": reel_id}).mappings().first()
+    if not row or row["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Reel not found")
+    return dict(row)
+
+
+# -----------------------------
 # Models
 # -----------------------------
 class CreateUploadRequest(BaseModel):
-    user_id: str
+    # user_id is ignored (kept so older app versions don't error);
+    # the owner always comes from the verified login token.
+    user_id: Optional[str] = None
     original_filename: str
     content_type: Optional[str] = None
 
@@ -139,40 +234,40 @@ async def _fetch_clerk_users(user_ids: list[str]) -> dict[str, dict]:
 # -----------------------------
 @app.get("/api/health")
 def health():
-    db_ok = False; db_error = None
+    db_ok = False
     try:
         with engine.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
         db_ok = True
-    except Exception as e:
-        db_error = str(e)
+    except Exception:
+        pass
 
-    redis_ok = False; redis_error = None
+    redis_ok = False
     try:
         r.ping(); redis_ok = True
-    except Exception as e:
-        redis_error = str(e)
+    except Exception:
+        pass
 
-    return {"status": "ok", "db_ok": db_ok, "db_error": db_error,
-            "redis_ok": redis_ok, "redis_error": redis_error}
+    # Error details go to the server log only, not to the public.
+    return {"status": "ok", "db_ok": db_ok, "redis_ok": redis_ok}
 
 
 # -----------------------------
-# Routes — uploads
+# Routes — uploads (signed-in owner only)
 # -----------------------------
 @app.post("/api/uploads/create")
-def create_upload(req: CreateUploadRequest):
+def create_upload(req: CreateUploadRequest, user_id: str = Depends(current_user)):
     upload_id = uuid.uuid4()
     original_filename = (req.original_filename or "").strip() or "upload.bin"
     safe_name = original_filename.replace("\\", "_").replace("/", "_")
     content_type = (req.content_type or "").strip() or "application/octet-stream"
-    s3_key = f"uploads/{req.user_id}/{upload_id}/{safe_name}"
+    s3_key = f"uploads/{user_id}/{upload_id}/{safe_name}"
 
     with engine.connect() as conn:
         row = conn.execute(sa.text("""
             SELECT COUNT(*) AS n FROM uploads
             WHERE user_id = :user_id AND created_at >= NOW() - INTERVAL '1 day'
-        """), {"user_id": req.user_id}).mappings().first()
+        """), {"user_id": user_id}).mappings().first()
 
     if int(row["n"] or 0) >= 20:
         return {"error": "upload_limit_reached", "message": "Daily upload limit reached."}
@@ -181,7 +276,7 @@ def create_upload(req: CreateUploadRequest):
         conn.execute(sa.text("""
             INSERT INTO uploads (id, user_id, original_filename, content_type, s3_key, bucket, status)
             VALUES (:id, :user_id, :original_filename, :content_type, :s3_key, :bucket, 'created')
-        """), {"id": str(upload_id), "user_id": req.user_id,
+        """), {"id": str(upload_id), "user_id": user_id,
                "original_filename": original_filename, "content_type": content_type,
                "s3_key": s3_key, "bucket": S3_UPLOADS_BUCKET})
 
@@ -196,7 +291,11 @@ def create_upload(req: CreateUploadRequest):
 
 
 @app.post("/api/uploads/complete")
-def complete_upload(req: CompleteUploadRequest):
+def complete_upload(req: CompleteUploadRequest, user_id: str = Depends(current_user)):
+    upload = _require_upload_owner(req.upload_id, user_id)
+    # Only queue each upload once, so repeated calls can't run up AI costs.
+    if upload["status"] != "created":
+        return {"status": "ok", "upload_id": req.upload_id, "already_queued": True}
     with engine.begin() as conn:
         conn.execute(sa.text("UPDATE uploads SET status='uploaded' WHERE id = :id"),
                      {"id": req.upload_id})
@@ -205,29 +304,31 @@ def complete_upload(req: CompleteUploadRequest):
 
 
 @app.get("/api/uploads/recent")
-def recent_uploads(limit: int = 20):
+def recent_uploads(limit: int = 20, user_id: str = Depends(current_user)):
+    limit = max(1, min(int(limit), 200))
     with engine.connect() as conn:
         rows = conn.execute(sa.text("""
             SELECT id, user_id, original_filename, content_type, s3_key, bucket, status, created_at
-            FROM uploads ORDER BY created_at DESC LIMIT :limit
-        """), {"limit": limit}).mappings().all()
+            FROM uploads WHERE user_id = :user_id
+            ORDER BY created_at DESC LIMIT :limit
+        """), {"user_id": user_id, "limit": limit}).mappings().all()
     return {"uploads": [dict(row) for row in rows]}
 
 
 @app.get("/api/debug/uploads/{upload_id}/counts")
-def debug_counts(upload_id: str):
+def debug_counts(upload_id: str, user_id: str = Depends(current_user)):
+    upload = _require_upload_owner(upload_id, user_id)
     with engine.connect() as conn:
-        upload = conn.execute(
-            sa.text("SELECT id, status FROM uploads WHERE id = :id"),
-            {"id": upload_id}).mappings().first()
         clip_count = conn.execute(
             sa.text("SELECT COUNT(*) AS n FROM clips WHERE upload_id = :id"),
             {"id": upload_id}).mappings().first()
-    return {"upload": upload, "clip_count": int(clip_count["n"])}
+    return {"upload": {"id": upload["id"], "status": upload["status"]},
+            "clip_count": int(clip_count["n"])}
 
 
 @app.get("/api/uploads/{upload_id}/clips")
-def clips_for_upload(upload_id: str):
+def clips_for_upload(upload_id: str, user_id: str = Depends(current_user)):
+    _require_upload_owner(upload_id, user_id)
     with engine.connect() as conn:
         rows = conn.execute(sa.text("""
             SELECT id, upload_id, bucket, s3_key, thumbnail_s3_key,
@@ -242,8 +343,9 @@ def clips_for_upload(upload_id: str):
 
 
 @app.get("/api/uploads/{upload_id}/summary")
-def upload_summary(upload_id: str):
+def upload_summary(upload_id: str, user_id: str = Depends(current_user)):
     """Returns hit + swing counts for an upload — used by the uploads page."""
+    _require_upload_owner(upload_id, user_id)
     with engine.connect() as conn:
         row = conn.execute(sa.text("""
             SELECT
@@ -257,9 +359,12 @@ def upload_summary(upload_id: str):
         "swing_count": int(row["swing_count"] or 0),
         "total_clips": int(row["total_clips"] or 0),
     }
+
+
 @app.get("/api/uploads/{upload_id}/thumbnail")
-def upload_thumbnail(upload_id: str):
+def upload_thumbnail(upload_id: str, user_id: str = Depends(current_user)):
     """Returns a short-lived presigned URL for the first clip thumbnail of an upload."""
+    _require_upload_owner(upload_id, user_id)
     with engine.connect() as conn:
         row = conn.execute(sa.text("""
             SELECT thumbnail_s3_key
@@ -280,8 +385,10 @@ def upload_thumbnail(upload_id: str):
     )
     return {"thumbnail_url": url}
 
+
 @app.get("/api/uploads/{upload_id}/reels")
-def reels_for_upload(upload_id: str):
+def reels_for_upload(upload_id: str, user_id: str = Depends(current_user)):
+    _require_upload_owner(upload_id, user_id)
     with engine.connect() as conn:
         rows = conn.execute(sa.text("""
             SELECT r.id, r.user_id, r.player_name, r.jersey_number,
@@ -297,29 +404,26 @@ def reels_for_upload(upload_id: str):
 # DELETE /api/uploads/bulk  — must be before /{upload_id}
 # -----------------------------------------------------------------------
 @app.delete("/api/uploads/bulk")
-def bulk_delete_uploads(req: BulkDeleteRequest):
+def bulk_delete_uploads(req: BulkDeleteRequest, user_id: str = Depends(current_user)):
     if not req.upload_ids:
         return {"deleted": [], "errors": []}
     deleted, errors = [], []
     for upload_id in req.upload_ids:
         try:
-            _delete_upload(upload_id); deleted.append(upload_id)
+            _delete_upload(upload_id, user_id); deleted.append(upload_id)
         except HTTPException as e:
             errors.append({"upload_id": upload_id, "error": e.detail})
         except Exception as e:
-            errors.append({"upload_id": upload_id, "error": str(e)})
+            print(f"[bulk_delete] {upload_id}: {e}")
+            errors.append({"upload_id": upload_id, "error": "delete_failed"})
     return {"deleted": deleted, "errors": errors}
 
 
-def _delete_upload(upload_id: str):
+def _delete_upload(upload_id: str, user_id: str):
+    upload = _require_upload_owner(upload_id, user_id)
     with engine.connect() as conn:
-        upload = conn.execute(
-            sa.text("SELECT s3_key, bucket FROM uploads WHERE id = :id"),
-            {"id": upload_id}).mappings().first()
-        if not upload:
-            raise HTTPException(status_code=404, detail="Upload not found")
         clip_rows = conn.execute(
-            sa.text("SELECT s3_key, bucket FROM clips WHERE upload_id = :id"),
+            sa.text("SELECT s3_key, thumbnail_s3_key, bucket FROM clips WHERE upload_id = :id"),
             {"id": upload_id}).mappings().all()
         reel_rows = conn.execute(
             sa.text("SELECT s3_key FROM reels WHERE upload_id = :id"),
@@ -332,7 +436,9 @@ def _delete_upload(upload_id: str):
             print(f"[delete_upload] S3 fail {key}: {e}")
 
     del_s3(upload["bucket"], upload["s3_key"])
-    for c in clip_rows: del_s3(c["bucket"], c["s3_key"])
+    for c in clip_rows:
+        del_s3(c["bucket"], c["s3_key"])
+        del_s3(S3_CLIPS_BUCKET, c["thumbnail_s3_key"])
     for re in reel_rows:
         if re["s3_key"]: del_s3(S3_CLIPS_BUCKET, re["s3_key"])
 
@@ -343,50 +449,42 @@ def _delete_upload(upload_id: str):
 
 
 @app.delete("/api/uploads/{upload_id}")
-def delete_upload(upload_id: str):
-    _delete_upload(upload_id)
+def delete_upload(upload_id: str, user_id: str = Depends(current_user)):
+    _delete_upload(upload_id, user_id)
     return {"deleted": True, "upload_id": upload_id}
 
 
 # -----------------------------
-# Routes — clips
+# Routes — clips (signed-in owner only)
 # -----------------------------
 @app.get("/api/clips/{clip_id}/download")
-def clip_download(clip_id: str):
-    with engine.connect() as conn:
-        row = conn.execute(
-            sa.text("SELECT bucket, s3_key FROM clips WHERE id = :id"),
-            {"id": clip_id}).mappings().first()
-    if not row:
-        return {"error": "not_found"}
+def clip_download(clip_id: str, user_id: str = Depends(current_user)):
+    clip = _require_clip_owner(clip_id, user_id)
     url = s3.generate_presigned_url(
         ClientMethod="get_object",
-        Params={"Bucket": row["bucket"], "Key": row["s3_key"]},
+        Params={"Bucket": clip["bucket"], "Key": clip["s3_key"]},
         ExpiresIn=900,
     )
     return {"download_url": url}
 
+
 @app.get("/api/clips/{clip_id}/thumbnail")
-def clip_thumbnail(clip_id: str):
+def clip_thumbnail(clip_id: str, user_id: str = Depends(current_user)):
     """Returns a short-lived presigned URL for a single clip's thumbnail."""
-    with engine.connect() as conn:
-        row = conn.execute(
-            sa.text("SELECT thumbnail_s3_key FROM clips WHERE id = :id"),
-            {"id": clip_id},
-        ).mappings().first()
-
-    if not row or not row["thumbnail_s3_key"]:
+    clip = _require_clip_owner(clip_id, user_id)
+    if not clip["thumbnail_s3_key"]:
         raise HTTPException(status_code=404, detail="No thumbnail available")
-
     url = s3.generate_presigned_url(
         ClientMethod="get_object",
-        Params={"Bucket": S3_CLIPS_BUCKET, "Key": row["thumbnail_s3_key"]},
+        Params={"Bucket": S3_CLIPS_BUCKET, "Key": clip["thumbnail_s3_key"]},
         ExpiresIn=3600,
     )
     return {"thumbnail_url": url}
 
+
 @app.patch("/api/clips/{clip_id}")
-def update_clip(clip_id: str, req: UpdateClipRequest):
+def update_clip(clip_id: str, req: UpdateClipRequest, user_id: str = Depends(current_user)):
+    _require_clip_owner(clip_id, user_id)
     player_name   = (req.player_name   or "").strip() or None
     jersey_number = (req.jersey_number or "").strip() or None
     with engine.begin() as conn:
@@ -399,8 +497,6 @@ def update_clip(clip_id: str, req: UpdateClipRequest):
                    player_name, jersey_number, created_at
             FROM clips WHERE id=:id
         """), {"id": clip_id}).mappings().first()
-    if not row:
-        return {"error": "not_found"}
     return {"clip": dict(row)}
 
 
@@ -408,28 +504,34 @@ def update_clip(clip_id: str, req: UpdateClipRequest):
 # Routes — reels
 # -----------------------------
 @app.post("/api/reels/compile")
-def compile_reel(req: CompileReelRequest):
+def compile_reel(req: CompileReelRequest, user_id: str = Depends(current_user)):
     if not req.clip_ids:
         return {"error": "no_clips", "message": "clip_ids must not be empty"}
+    if not all(_valid_uuid(c) for c in req.clip_ids):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    upload_row = _require_upload_owner(req.upload_id, user_id)
 
     with engine.connect() as conn:
+        # Every requested clip must come from one of this user's uploads.
+        owned_rows = conn.execute(sa.text("""
+            SELECT c.id, c.upload_id FROM clips c
+            JOIN uploads u ON u.id = c.upload_id
+            WHERE c.id = ANY(CAST(:ids AS uuid[])) AND u.user_id = :user_id
+        """), {"ids": req.clip_ids, "user_id": user_id}).mappings().all()
+        if len(owned_rows) != len(set(req.clip_ids)):
+            raise HTTPException(status_code=404, detail="Clip not found")
+
         # For all_swings mode, expand clip_ids to include swing clips from same uploads
         if req.mode == "all_swings":
-            # Get upload_ids from the provided clip_ids
-            upload_ids_row = conn.execute(sa.text("""
-                SELECT DISTINCT upload_id FROM clips
-                WHERE id = ANY(CAST(:ids AS uuid[]))
-            """), {"ids": req.clip_ids}).mappings().all()
-            upload_ids = [r["upload_id"] for r in upload_ids_row]
-
-            # Fetch all swing clips (hits + misses) from those uploads
+            upload_ids = list({str(r["upload_id"]) for r in owned_rows})
             swing_rows = conn.execute(sa.text("""
                 SELECT id FROM clips
                 WHERE upload_id = ANY(CAST(:uids AS uuid[]))
                   AND (is_hit = true OR is_swing = true)
                 ORDER BY start_sec ASC
             """), {"uids": upload_ids}).mappings().all()
-            clip_ids_to_use = [r["id"] for r in swing_rows] or req.clip_ids
+            clip_ids_to_use = [str(r["id"]) for r in swing_rows] or req.clip_ids
         else:
             clip_ids_to_use = req.clip_ids
 
@@ -441,17 +543,13 @@ def compile_reel(req: CompileReelRequest):
             ORDER BY COUNT(*) DESC LIMIT 1
         """), {"ids": clip_ids_to_use}).mappings().first()
 
-        upload_row = conn.execute(
-            sa.text("SELECT user_id, created_at FROM uploads WHERE id = :id"),
+        created_row = conn.execute(
+            sa.text("SELECT created_at FROM uploads WHERE id = :id"),
             {"id": req.upload_id}).mappings().first()
-
-    if not upload_row:
-        return {"error": "upload_not_found"}
 
     player_name   = player_row["player_name"]   if player_row else "Unknown"
     jersey_number = player_row["jersey_number"] if player_row else None
-    game_date     = upload_row["created_at"].date()
-    user_id       = upload_row["user_id"]
+    game_date     = created_row["created_at"].date()
     reel_id       = str(uuid.uuid4())
 
     with engine.begin() as conn:
@@ -460,7 +558,7 @@ def compile_reel(req: CompileReelRequest):
                                game_date, status, clip_count)
             VALUES (:id, :user_id, :upload_id, :player_name, :jersey_number,
                     :game_date, 'pending', :clip_count)
-        """), {"id": reel_id, "user_id": user_id, "upload_id": req.upload_id,
+        """), {"id": reel_id, "user_id": user_id, "upload_id": upload_row["id"],
                "player_name": player_name, "jersey_number": jersey_number,
                "game_date": game_date, "clip_count": len(clip_ids_to_use)})
 
@@ -471,7 +569,7 @@ def compile_reel(req: CompileReelRequest):
         "player_name":   player_name,
         "jersey_number": jersey_number or "",
         "game_date":     game_date.isoformat(),
-        "clip_ids":      clip_ids_to_use,
+        "clip_ids":      [str(c) for c in clip_ids_to_use],
         "watermark":     req.watermark,
     })
     r.lpush("clipflow:jobs", job_payload)
@@ -479,13 +577,8 @@ def compile_reel(req: CompileReelRequest):
 
 
 @app.delete("/api/reels/{reel_id}")
-def delete_reel(reel_id: str):
-    with engine.connect() as conn:
-        row = conn.execute(
-            sa.text("SELECT s3_key FROM reels WHERE id = :id"),
-            {"id": reel_id}).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Reel not found")
+def delete_reel(reel_id: str, user_id: str = Depends(current_user)):
+    row = _require_reel_owner(reel_id, user_id)
     if row["s3_key"]:
         try:
             s3.delete_object(Bucket=S3_CLIPS_BUCKET, Key=row["s3_key"])
@@ -498,6 +591,9 @@ def delete_reel(reel_id: str):
 
 @app.get("/api/reels/{reel_id}/public")
 def reel_public(reel_id: str):
+    """Public on purpose: this powers the share link a family sends out."""
+    if not _valid_uuid(reel_id):
+        return {"error": "not_found"}
     with engine.connect() as conn:
         row = conn.execute(sa.text("""
             SELECT id, player_name, jersey_number, game_date,
@@ -517,13 +613,8 @@ def reel_public(reel_id: str):
 
 
 @app.get("/api/reels/{reel_id}/download")
-def reel_download(reel_id: str):
-    with engine.connect() as conn:
-        row = conn.execute(
-            sa.text("SELECT status, s3_key FROM reels WHERE id = :id"),
-            {"id": reel_id}).mappings().first()
-    if not row:
-        return {"error": "not_found"}
+def reel_download(reel_id: str, user_id: str = Depends(current_user)):
+    row = _require_reel_owner(reel_id, user_id)
     if row["status"] != "complete":
         return {"error": "not_ready", "status": row["status"]}
     url = s3.generate_presigned_url(
@@ -535,17 +626,15 @@ def reel_download(reel_id: str):
 
 
 # -----------------------------
-# Routes — admin
+# Routes — admin (verified login + Clerk "admin" role)
 # -----------------------------
-@app.get("/api/admin/stats")
-async def admin_stats(
-    x_admin_secret: str = Header(default=None),
-    x_clerk_user_id: str = Header(default=None),
-):
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await _assert_clerk_admin(x_clerk_user_id)
+async def admin_user(user_id: str = Depends(current_user)) -> str:
+    await _assert_clerk_admin(user_id)
+    return user_id
 
+
+@app.get("/api/admin/stats")
+async def admin_stats(_admin: str = Depends(admin_user)):
     with engine.connect() as conn:
         dau = conn.execute(sa.text("""
             SELECT COUNT(DISTINCT user_id) AS n FROM uploads
@@ -585,14 +674,7 @@ async def admin_stats(
 
 
 @app.get("/api/admin/users")
-async def admin_users(
-    x_admin_secret: str = Header(default=None),
-    x_clerk_user_id: str = Header(default=None),
-):
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await _assert_clerk_admin(x_clerk_user_id)
-
+async def admin_users(_admin: str = Depends(admin_user)):
     with engine.connect() as conn:
         rows = conn.execute(sa.text("""
             SELECT user_id, COUNT(*) AS upload_count, MAX(created_at) AS last_upload_at
@@ -602,10 +684,10 @@ async def admin_users(
     db_users = {r["user_id"]: dict(r) for r in rows}
     clerk_users = await _fetch_clerk_users(list(db_users.keys()))
     result = []
-    for user_id, db in db_users.items():
-        clerk = clerk_users.get(user_id, {})
+    for uid, db in db_users.items():
+        clerk = clerk_users.get(uid, {})
         result.append({
-            "user_id": user_id, "email": clerk.get("email", ""),
+            "user_id": uid, "email": clerk.get("email", ""),
             "name": clerk.get("name", ""), "upload_count": int(db.get("upload_count", 0)),
             "last_upload_at": str(db.get("last_upload_at", "")),
         })
@@ -613,13 +695,7 @@ async def admin_users(
 
 
 @app.get("/api/admin/anthropic-balance")
-async def admin_anthropic_balance(
-    x_admin_secret: str = Header(default=None),
-    x_clerk_user_id: str = Header(default=None),
-):
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await _assert_clerk_admin(x_clerk_user_id)
+async def admin_anthropic_balance(_admin: str = Depends(admin_user)):
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(
