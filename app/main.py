@@ -174,6 +174,7 @@ class CompleteUploadRequest(BaseModel):
 class UpdateClipRequest(BaseModel):
     player_name: Optional[str] = None
     jersey_number: Optional[str] = None
+    is_hit: Optional[bool] = None   # family's own call; overrides the AI
 
 class CompileReelRequest(BaseModel):
     upload_id: str
@@ -485,16 +486,25 @@ def clip_thumbnail(clip_id: str, user_id: str = Depends(current_user)):
 @app.patch("/api/clips/{clip_id}")
 def update_clip(clip_id: str, req: UpdateClipRequest, user_id: str = Depends(current_user)):
     _require_clip_owner(clip_id, user_id)
-    player_name   = (req.player_name   or "").strip() or None
-    jersey_number = (req.jersey_number or "").strip() or None
+    sent = req.model_dump(exclude_unset=True)   # only change the fields the page sent
+    sets, params = [], {"id": clip_id}
+    for field in ("player_name", "jersey_number"):
+        if field in sent:
+            sets.append(f"{field} = :{field}")
+            params[field] = (sent[field] or "").strip() or None
+    if "is_hit" in sent:
+        sets.append("is_hit = :is_hit")
+        params["is_hit"] = sent["is_hit"]
+        if sent["is_hit"]:
+            sets.append("is_swing = true")
+        sets.append("ai_reason = :why")
+        params["why"] = "Marked by you as a hit" if sent["is_hit"] else "Marked by you as not a hit"
     with engine.begin() as conn:
-        conn.execute(sa.text("""
-            UPDATE clips SET player_name=:player_name, jersey_number=:jersey_number
-            WHERE id=:id
-        """), {"id": clip_id, "player_name": player_name, "jersey_number": jersey_number})
+        if sets:
+            conn.execute(sa.text(f"UPDATE clips SET {', '.join(sets)} WHERE id = :id"), params)
         row = conn.execute(sa.text("""
             SELECT id, upload_id, bucket, s3_key, start_sec, end_sec, label,
-                   player_name, jersey_number, created_at
+                   player_name, jersey_number, is_hit, is_swing, ai_confidence, ai_reason, created_at
             FROM clips WHERE id=:id
         """), {"id": clip_id}).mappings().first()
     return {"clip": dict(row)}

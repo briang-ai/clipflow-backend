@@ -3,7 +3,6 @@ import time
 import uuid
 import math
 import json
-import base64
 import tempfile
 import subprocess
 
@@ -13,10 +12,12 @@ import sqlalchemy as sa
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from clipflow_ai.pipeline import analyze
+
 
 # --- Load env ---
 load_dotenv()
-print("WORKER VERSION: thumbnails_v5", flush=True)
+print("WORKER VERSION: hitfinder_v1", flush=True)
 
 
 def env_required(name: str) -> str:
@@ -37,11 +38,15 @@ S3_UPLOADS_BUCKET = env_required("S3_UPLOADS_BUCKET")
 S3_CLIPS_BUCKET = env_required("S3_CLIPS_BUCKET")
 
 ANTHROPIC_API_KEY = env_required("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.82"))
+# Model that judges each detected swing. Sonnet found 13/13 hits on the test set;
+# Haiku is about half the cost. Set HIT_MODEL=claude-haiku-4-5-20251001 to switch.
+HIT_MODEL = os.getenv("HIT_MODEL", "claude-sonnet-5")
 
 # --- Tuning ---
-CLIP_SECONDS = float(os.getenv("CLIP_SECONDS", "8"))
+HIT_PRE_S = float(os.getenv("HIT_PRE_S", "2.5"))        # seconds kept before the swing
+HIT_POST_S = float(os.getenv("HIT_POST_S", "4.0"))      # seconds kept after (ball flight, run)
+FULL_CLIP_MAX_S = float(os.getenv("FULL_CLIP_MAX_S", "90"))  # also keep the whole upload if shorter
+LONG_CHUNK_S = float(os.getenv("LONG_CHUNK_S", "30"))   # longer uploads: plain chunks to browse
 MAX_SEGMENTS = int(os.getenv("MAX_SEGMENTS", "30"))
 SCALE_HEIGHT = int(os.getenv("SCALE_HEIGHT", "1080"))
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "1")
@@ -185,22 +190,6 @@ def run_ffprobe_duration_seconds(source_path: str) -> float:
     raise RuntimeError("Could not determine duration from ffprobe output")
 
 
-def build_segments(duration_sec: float, clip_seconds: float) -> list[tuple[float, float, str]]:
-    duration_sec = float(duration_sec or 0)
-    if duration_sec <= 0:
-        return []
-    clip_seconds = max(1.0, float(clip_seconds))
-    count = int(math.ceil(duration_sec / clip_seconds))
-    segments: list[tuple[float, float, str]] = []
-    for i in range(count):
-        start = round(i * clip_seconds, 3)
-        end = round(min((i + 1) * clip_seconds, duration_sec), 3)
-        if end <= start:
-            continue
-        segments.append((start, end, f"segment_{i+1:03d}"))
-    return segments
-
-
 def run_ffmpeg_extract(source_path: str, out_path: str, start_sec: float, duration_sec: float):
     cmd = [
         "ffmpeg", "-y",
@@ -208,6 +197,7 @@ def run_ffmpeg_extract(source_path: str, out_path: str, start_sec: float, durati
         "-ss", str(start_sec),
         "-i", source_path,
         "-t", str(duration_sec),
+        "-map_metadata", "-1",          # drop phone metadata (incl. GPS location)
         "-vf", f"scale=-2:{SCALE_HEIGHT}",
         "-preset", "fast",
         "-crf", "23",
@@ -215,11 +205,10 @@ def run_ffmpeg_extract(source_path: str, out_path: str, start_sec: float, durati
         "-b:a", "128k",
         out_path,
     ]
-    print("FFMPEG CMD:", " ".join(cmd), flush=True)
     p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.stderr:
-        print("FFMPEG STDERR:\n", p.stderr, flush=True)
     if p.returncode != 0:
+        # only the tail: the head of ffmpeg's log lists the phone's metadata, GPS included
+        print("FFMPEG ERROR:", (p.stderr or "")[-400:], flush=True)
         raise RuntimeError(f"ffmpeg failed with code {p.returncode}")
 
 
@@ -239,170 +228,58 @@ def extract_jpeg_frame(video_path: str, out_path: str, offset_sec: float):
         raise RuntimeError(f"frame extraction did not create file: {out_path}")
 
 
-def extract_thumbnail(clip_path: str, tmpdir: str, clip_duration: float) -> str:
-    """Extract a thumbnail JPEG from ~10% into the clip. Returns local path."""
-    offset = min(max(0.5, clip_duration * 0.1), clip_duration - 0.1)
-    thumb_path = os.path.join(tmpdir, "thumb.jpg")
+def extract_thumbnail(clip_path: str, tmpdir: str, at_sec: float, clip_duration: float) -> str:
+    """Extract a thumbnail JPEG at at_sec into the clip. Returns local path."""
+    offset = min(max(0.1, at_sec), max(0.1, clip_duration - 0.1))
+    thumb_path = os.path.join(tmpdir, f"thumb_{uuid.uuid4().hex[:8]}.jpg")
     extract_jpeg_frame(clip_path, thumb_path, offset)
     return thumb_path
 
 
-def image_block_from_file(path: str) -> dict:
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-    return {
-        "type": "image",
-        "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
-    }
-
-
-# ---------------------------------------------------------------
-# AI classification
-# ---------------------------------------------------------------
-
-def extract_frames_for_ai(clip_path: str, tdir: str, clip_duration: float, count: int = 10) -> list[str]:
-    frame_times = [
-        min(max(0.1, round(clip_duration * (i / (count - 1)), 3)), clip_duration - 0.1)
-        for i in range(count)
-    ]
-    frame_paths = []
-    for i, t in enumerate(frame_times):
-        fp = os.path.join(tdir, f"f{i+1:02d}.jpg")
-        extract_jpeg_frame(clip_path, fp, t)
-        frame_paths.append(fp)
-    print(f"Extracted {count} frames at times: {frame_times}", flush=True)
-    return frame_paths
-
-
-def get_audio_features(video_path: str) -> str:
-    with tempfile.TemporaryDirectory() as tdir:
-        stats_path = os.path.join(tdir, "astats.txt")
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-af", "astats=metadata=1:reset=1,ametadata=print:file=" + stats_path,
-            "-vn", "-f", "null", "-",
-        ]
-        subprocess.run(cmd, capture_output=True, text=True)
-        if not os.path.exists(stats_path):
-            return "Audio stats unavailable."
-        with open(stats_path) as f:
-            lines = f.readlines()
-        peaks = []
-        for line in lines:
-            if "lavfi.astats.Overall.Peak_level" in line:
-                try:
-                    peaks.append(float(line.strip().split("=")[1]))
-                except ValueError:
-                    pass
-        if not peaks:
-            return "No audio peak data available."
-        max_peak = max(peaks)
-        min_peak = min(peaks)
-        peak_range = max_peak - min_peak
-        summary = (f"Peak audio level: {max_peak:.1f} dB, Min level: {min_peak:.1f} dB, "
-                   f"Dynamic range: {peak_range:.1f} dB. ")
-        summary += ("A sharp audio transient was detected — possible bat-ball contact."
-                    if peak_range > 20 else
-                    "No sharp audio transient — less likely to contain bat-ball contact.")
-        return summary
-
-
-def classify_clip_with_ai(clip_path: str) -> tuple[bool | None, bool | None, float | None, str | None]:
-    with tempfile.TemporaryDirectory() as tdir:
-        clip_duration = run_ffprobe_duration_seconds(clip_path)
-        audio_summary = "Audio analysis unavailable."
-        try:
-            audio_summary = get_audio_features(clip_path)
-            print(f"Audio features: {audio_summary}", flush=True)
-        except Exception as e:
-            print(f"Audio feature extraction skipped: {e}", flush=True)
-
-        frame_paths = extract_frames_for_ai(clip_path, tdir, clip_duration, count=10)
-
-        system_prompt = (
-            "You are an expert youth baseball video analyst. Your job is to classify "
-            "8-second clips from Little League games for a player highlight reel. "
-            "You must be CONSERVATIVE — it is far better to miss a real hit than to "
-            "include a false positive.\n\n"
-
-            "You must return TWO boolean values:\n\n"
-
-            "1. is_hit — true ONLY when ALL of the following are visible:\n"
-            "   - A live pitch is delivered (ball thrown by pitcher toward batter)\n"
-            "   - The batter makes a FULL swing at that live pitch\n"
-            "   - Bat-ball contact is confirmed (ball changes direction, ball in flight "
-            "away from home plate, batter drops bat to run, fielders react)\n"
-            "   FALSE for: swing and miss, foul tip with no clear contact, batter "
-            "standing still, practice/warmup swings before pitch, ball hitting "
-            "catcher's mitt, dead time between pitches, fielding plays, baserunning.\n\n"
-
-            "2. is_swing — true ONLY when a batter makes a FULL swing arc at a LIVE "
-            "pitch (pitcher has released the ball toward home plate).\n"
-            "   FALSE for: practice swings before the pitch, warmup swings in the "
-            "on-deck circle, checked swings that stop before the hitting zone, "
-            "batter adjusting stance, no pitch in progress.\n\n"
-
-            "Key false positive patterns to REJECT:\n"
-            "   - Sharp audio crack from ball hitting catcher's mitt (no bat movement)\n"
-            "   - Batter taking practice swings while waiting for pitch\n"
-            "   - Loud crowd noise or equipment noise with no swing visible\n"
-            "   - Batter fouling off a pitch but ball stays near home plate\n"
-            "   - Clip shows only fielding, running, or between-pitch dead time\n"
-            "   - Batter swings but clip cuts before contact is visible\n\n"
-
-            "Rule: is_hit=true requires is_swing=true. "
-            "If you are not confident, set both to false and confidence below 0.5.\n"
-            "Return strict JSON only — no explanation outside the JSON."
-        )
-
-        user_text = (
-            f"Here are 10 sequential frames from a {clip_duration:.1f}-second "
-            "youth baseball clip. Treat them as a flip-book in chronological order.\n\n"
-            "Audio analysis: " + audio_summary + "\n\n"
-            "IMPORTANT: Audio alone is NOT sufficient to classify a hit. A sharp "
-            "audio crack is equally likely to be a ball hitting the catcher's mitt. "
-            "You MUST see visible bat-ball contact or ball flight in the frames to "
-            "set is_hit=true.\n\n"
-            "Return ONLY this JSON:\n"
-            "{\n"
-            "  \"is_hit\": true or false,\n"
-            "  \"is_swing\": true or false,\n"
-            "  \"confidence\": 0.0 to 1.0,\n"
-            "  \"reason\": \"1-2 sentences citing specific visual evidence\"\n"
-            "}"
-        )
-
-        content: list[dict] = [{"type": "text", "text": user_text}]
-        for fp in frame_paths:
-            content.append(image_block_from_file(fp))
-
-        resp = anthropic.messages.create(
-            model=ANTHROPIC_MODEL, max_tokens=300,
-            system=system_prompt,
-            messages=[{"role": "user", "content": content}],
-        )
-
-        text_parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
-        raw = "\n".join(text_parts).strip()
-        print("AI RAW RESPONSE:", raw, flush=True)
-
-        try:
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            data = json.loads(raw)
-            is_hit   = bool(data.get("is_hit"))
-            is_swing = bool(data.get("is_swing"))
-            if is_hit:
-                is_swing = True
-            confidence = float(data.get("confidence", 0.0))
-            reason = str(data.get("reason", ""))[:500]
-            return is_hit, is_swing, confidence, reason
-        except Exception:
-            return None, None, None, f"Unparseable AI response: {raw[:500]}"
+def call_claude(request: dict) -> dict:
+    """One Messages API call; returns the reply as a plain dict."""
+    resp = anthropic.messages.create(**request)
+    return resp.model_dump()
 
 
 # ---------------------------------------------------------------
 # Upload processor
 # ---------------------------------------------------------------
+
+def save_clip(upload_id: str, source_path: str, tmpdir: str, start: float, end: float,
+              label: str, thumb_at: float, is_hit, is_swing, confidence, reason):
+    """Cut [start, end] from the source, upload clip + thumbnail, insert the row."""
+    dur = round(end - start, 3)
+    if dur <= 0.2:
+        return None
+    clip_path = os.path.join(tmpdir, f"{label}.mp4")
+    run_ffmpeg_extract(source_path, clip_path, start_sec=round(start, 3), duration_sec=dur)
+
+    thumbnail_s3_key = None
+    try:
+        thumb_path = extract_thumbnail(clip_path, tmpdir, thumb_at, dur)
+        thumbnail_s3_key = f"thumbs/{upload_id}/{label}_{uuid.uuid4()}.jpg"
+        s3.upload_file(thumb_path, S3_CLIPS_BUCKET, thumbnail_s3_key,
+                       ExtraArgs={"ContentType": "image/jpeg"})
+    except Exception as e:
+        print(f"Thumbnail failed for {label}: {e}", flush=True)
+        thumbnail_s3_key = None
+
+    clip_s3_key = f"clips/{upload_id}/{label}_{uuid.uuid4()}.mp4"
+    s3.upload_file(clip_path, S3_CLIPS_BUCKET, clip_s3_key, ExtraArgs={"ContentType": "video/mp4"})
+    clip_id = db_insert_clip(
+        upload_id=upload_id, bucket=S3_CLIPS_BUCKET, s3_key=clip_s3_key,
+        thumbnail_s3_key=thumbnail_s3_key, start_sec=round(start, 3), end_sec=round(end, 3),
+        label=label, is_hit=is_hit, is_swing=is_swing, ai_confidence=confidence,
+        ai_reason=(reason or "")[:500],
+    )
+    try:
+        os.remove(clip_path)
+    except OSError:
+        pass
+    print(f"Saved clip {label} {start:.2f}-{end:.2f}s hit={is_hit} id={clip_id}", flush=True)
+    return clip_id
+
 
 def process_upload(upload_id: str):
     print(f"Processing upload_id={upload_id}", flush=True)
@@ -412,92 +289,65 @@ def process_upload(upload_id: str):
         print(f"Upload not found in DB: {upload_id}", flush=True)
         return
 
-    src_bucket = upload["bucket"]
-    src_key = upload["s3_key"]
-
     db_set_upload_status(upload_id, "processing")
-    print("Set status=processing", flush=True)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         source_path = os.path.join(tmpdir, "source")
-        print("Downloading source from S3...", flush=True)
-        s3.download_file(src_bucket, src_key, source_path)
-
+        s3.download_file(upload["bucket"], upload["s3_key"], source_path)
         duration = run_ffprobe_duration_seconds(source_path)
         print(f"Detected duration: {duration:.3f} seconds", flush=True)
 
-        segments = build_segments(duration, CLIP_SECONDS)
-        print(f"Built {len(segments)} segments of ~{CLIP_SECONDS}s", flush=True)
-
-        if MAX_SEGMENTS > 0 and len(segments) > MAX_SEGMENTS:
-            print(f"MAX_SEGMENTS cap: trimming {len(segments)} -> {MAX_SEGMENTS}", flush=True)
-            segments = segments[:MAX_SEGMENTS]
+        # 1) find and judge the swings
+        result = analyze(source_path, call_claude, HIT_MODEL,
+                         log=lambda s: print(s, flush=True))
+        ai_down = result.ai_calls == 0 and bool(result.ai_errors)
+        if result.ai_errors:
+            print(f"AI problems for {upload_id}: {result.ai_errors}", flush=True)
 
         created = 0
+        # 2) one trimmed clip per swing, hits marked
+        swings = sorted(result.swings, key=lambda m: m.t)
+        if ai_down:
+            # AI unavailable (e.g. no API credit): keep the loudest moments, unscored,
+            # so the family can still pick their hits by hand.
+            swings = sorted(sorted(result.moments, key=lambda m: -m.audio_z)[:4], key=lambda m: m.t)
+        for n, m in enumerate(swings, 1):
+            start = max(0.0, m.t - HIT_PRE_S)
+            end = min(duration, m.t + HIT_POST_S)
+            if ai_down:
+                label, is_hit, is_swing, conf = f"moment_{n:02d}", None, None, None
+                reason = "AI check unavailable - not scored"
+            elif m.possible_hit:
+                # blocked view (netting / other cages): let the family confirm
+                label, is_hit, is_swing, conf = f"maybe_{n:02d}", None, True, m.confidence
+                reason = ("Possible hit - netting or other hitters kept the AI from seeing "
+                          f"contact clearly. Mark it if it was a hit. ({m.reason})")
+            else:
+                label = f"{'hit' if m.final_hit else 'swing'}_{n:02d}"
+                is_hit, is_swing, conf = bool(m.final_hit), True, m.confidence
+                reason = f"{m.label.replace('_', ' ')}: {m.reason}"
+                if m.label == "hit" and not m.final_hit:
+                    reason = "likely foul or duplicate of a louder hit - " + reason
+            if save_clip(upload_id, source_path, tmpdir, start, end, label, m.t - start,
+                         is_hit, is_swing, conf, reason):
+                created += 1
 
-        for (start_sec, end_sec, label) in segments:
-            seg_dur = round(end_sec - start_sec, 3)
-            if seg_dur <= 0:
-                continue
+        # 3) the rest of the footage, so nothing the AI missed is lost
+        if duration <= FULL_CLIP_MAX_S:
+            if save_clip(upload_id, source_path, tmpdir, 0.0, duration, "full_clip",
+                         min(1.0, duration / 2), None, False, None, "Whole upload"):
+                created += 1
+        else:
+            n_chunks = min(MAX_SEGMENTS, int(math.ceil(duration / LONG_CHUNK_S)))
+            for i in range(n_chunks):
+                a, b = i * LONG_CHUNK_S, min(duration, (i + 1) * LONG_CHUNK_S)
+                if save_clip(upload_id, source_path, tmpdir, a, b, f"part_{i + 1:03d}",
+                             min(1.0, (b - a) / 2), None, False, None, "Part of the full upload"):
+                    created += 1
 
-            clip_path = os.path.join(tmpdir, f"{label}.mp4")
-            print(f"Segment {label}: start={start_sec} dur={seg_dur}", flush=True)
-            run_ffmpeg_extract(source_path, clip_path, start_sec=start_sec, duration_sec=seg_dur)
-
-            # ── Generate thumbnail ──────────────────────────────────────────
-            thumbnail_s3_key = None
-            try:
-                thumb_path = extract_thumbnail(clip_path, tmpdir, seg_dur)
-                thumbnail_s3_key = f"thumbs/{upload_id}/{label}_{uuid.uuid4()}.jpg"
-                s3.upload_file(
-                    thumb_path, S3_CLIPS_BUCKET, thumbnail_s3_key,
-                    ExtraArgs={"ContentType": "image/jpeg"},
-                )
-                print(f"Thumbnail uploaded: {thumbnail_s3_key}", flush=True)
-            except Exception as e:
-                print(f"Thumbnail failed for {label}: {e}", flush=True)
-                thumbnail_s3_key = None
-
-            # ── AI classification ───────────────────────────────────────────
-            try:
-                print(f"ABOUT TO CALL AI FOR {label}", flush=True)
-                is_hit, is_swing, ai_confidence, ai_reason = classify_clip_with_ai(clip_path)
-                print(
-                    f"AI RESULT {label}: is_hit={is_hit} is_swing={is_swing} "
-                    f"confidence={ai_confidence} reason={ai_reason}",
-                    flush=True,
-                )
-            except Exception as e:
-                print(f"AI FAILED FOR {label}: {e}", flush=True)
-                is_hit = None
-                is_swing = None
-                ai_confidence = None
-                ai_reason = f"AI failed: {e}"
-
-            # ── Upload clip ─────────────────────────────────────────────────
-            clip_s3_key = f"clips/{upload_id}/{label}_{uuid.uuid4()}.mp4"
-            s3.upload_file(
-                clip_path, S3_CLIPS_BUCKET, clip_s3_key,
-                ExtraArgs={"ContentType": "video/mp4"},
-            )
-
-            clip_id = db_insert_clip(
-                upload_id=upload_id,
-                bucket=S3_CLIPS_BUCKET,
-                s3_key=clip_s3_key,
-                thumbnail_s3_key=thumbnail_s3_key,
-                start_sec=start_sec,
-                end_sec=end_sec,
-                label=label,
-                is_hit=is_hit,
-                is_swing=is_swing,
-                ai_confidence=ai_confidence,
-                ai_reason=ai_reason,
-            )
-            created += 1
-            print(f"Inserted clip row OK. clip_id={clip_id}", flush=True)
-
-        print(f"Created {created} clips for upload_id={upload_id}", flush=True)
+        print(f"Created {created} clips for upload_id={upload_id}; "
+              f"AI cost ${result.cost_usd:.4f} ({result.input_tokens} in / {result.output_tokens} out)",
+              flush=True)
 
     db_set_upload_status(upload_id, "complete")
     print("Set status=complete", flush=True)
@@ -594,9 +444,8 @@ def process_compile_reel(job: dict):
                 ]
 
             np = subprocess.run(norm_cmd, capture_output=True, text=True)
-            if np.stderr:
-                print(f"Normalize clip {i} STDERR:\n{np.stderr[-500:]}", flush=True)
             if np.returncode != 0:
+                print(f"Normalize clip {i} error: {(np.stderr or '')[-400:]}", flush=True)
                 print(f"Normalize failed for clip {i} — aborting reel.", flush=True)
                 db_set_reel_status(reel_id, "error")
                 return
@@ -616,15 +465,14 @@ def process_compile_reel(job: dict):
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-map_metadata", "-1",
             "-c", "copy",
             output_path,
         ]
 
-        print("FFMPEG CONCAT CMD:", " ".join(cmd), flush=True)
         p = subprocess.run(cmd, capture_output=True, text=True)
-        if p.stderr:
-            print("FFMPEG CONCAT STDERR:\n", p.stderr, flush=True)
         if p.returncode != 0:
+            print("FFMPEG CONCAT ERROR:", (p.stderr or "")[-400:], flush=True)
             raise RuntimeError(f"ffmpeg concat failed with code {p.returncode}")
 
         reel_s3_key = f"reels/{user_id}/{reel_id}/{output_filename}"
@@ -652,8 +500,7 @@ def main():
         "UPLOADS_BUCKET=", S3_UPLOADS_BUCKET,
         "CLIPS_BUCKET=", S3_CLIPS_BUCKET,
         "REGION=", AWS_REGION,
-        "MODEL=", ANTHROPIC_MODEL,
-        "CLIP_SECONDS=", CLIP_SECONDS,
+        "HIT_MODEL=", HIT_MODEL,
         "MAX_SEGMENTS=", MAX_SEGMENTS,
         "SCALE_HEIGHT=", SCALE_HEIGHT,
         "LOGO_PATH=", LOGO_PATH,
@@ -703,4 +550,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

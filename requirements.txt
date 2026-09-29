@@ -18,6 +18,8 @@ httpx==0.28.1
 idna==3.11
 jiter==0.13.0
 jmespath==1.1.0
+numpy==2.4.4
+opencv-python-headless==4.13.0.92
 psycopg-binary==3.3.3
 psycopg2-binary==2.9.11
 psycopg==3.3.3

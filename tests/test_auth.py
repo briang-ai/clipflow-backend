@@ -105,6 +105,11 @@ for m, p in [("get", f"/api/uploads/{B['upload']}/clips"), ("get", f"/api/upload
              ("get", f"/api/debug/uploads/{B['upload']}/counts"), ("get", f"/api/clips/{B['clip']}/download"),
              ("get", f"/api/clips/{B['clip']}/thumbnail"), ("get", f"/api/reels/{B['reel']}/download")]:
     check(f"Alice blocked from Bob's {p.split('/api/')[1].split('/')[0]} ({p.rsplit('/',1)[1]})", getattr(client, m)(p, headers=ALICE).status_code == 404)
+r = client.patch(f"/api/clips/{A['clip']}", headers=ALICE, json={"player_name": "Sam", "jersey_number": "7"})
+check("Alice can name her own clip", r.status_code == 200 and r.json()["clip"]["player_name"] == "Sam")
+r = client.patch(f"/api/clips/{A['clip']}", headers=ALICE, json={"is_hit": True})
+check("marking a hit keeps the player name", r.json()["clip"]["player_name"] == "Sam" and r.json()["clip"]["is_hit"] in (True, 1))
+check("Alice can't mark Bob's clip as a hit", client.patch(f"/api/clips/{B['clip']}", headers=ALICE, json={"is_hit": True}).status_code == 404)
 check("Alice can't rename Bob's clip", client.patch(f"/api/clips/{B['clip']}", headers=ALICE, json={"player_name": "x"}).status_code == 404)
 check("Alice can't queue Bob's upload for AI", client.post("/api/uploads/complete", headers=ALICE, json={"upload_id": B["upload"]}).status_code == 404)
 check("Alice can't build a reel from Bob's upload", client.post("/api/reels/compile", headers=ALICE, json={"upload_id": B["upload"], "clip_ids": [B["clip"]]}).status_code == 404)
